@@ -3,7 +3,6 @@ __pycache__/
 *.pyc
 .vscode/
 data/
-models/*.onnx
 results/**/*.avi
 results/**/*.cache
 *.tmp

@@ -35,6 +35,19 @@ cmake --build build-core -j4
 ctest --test-dir build-core --output-on-failure
 ```
 
+## 数据准备
+
+仓库不包含课程提供的实拍素材，请把它们放到下列路径后再运行：
+
+| 路径 | 内容 |
+| --- | --- |
+| `data/test.avi` | 531 帧、1440×1080 实拍视频 |
+| `data/imu.txt` | 531 条 IMU，`t qw qx qy qz`，平均 24.086 Hz |
+
+模型随仓库提交：`models/Infantry-v8n.onnx` 供 NN 检测，`models/mlp.onnx` 供传统检测器的数字分类。
+
+`--detection-cache` 指向的文件不存在时会自动重新推理并写出，不需要预先准备。
+
 ## 处理视频与输出
 
 ```bash
