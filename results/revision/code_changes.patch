@@ -1,0 +1,3855 @@
+--- a/.gitignore
++++ b/.gitignore
+@@ -0,0 +1,9 @@
++build*/
++__pycache__/
++*.pyc
++.vscode/
++data/
++models/*.onnx
++results/**/*.avi
++results/**/*.cache
++*.tmp
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1,50 +1,48 @@
+ cmake_minimum_required(VERSION 3.16)
+ project(rm_week3 LANGUAGES CXX)
+-
+ set(CMAKE_CXX_STANDARD 17)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ set(CMAKE_CXX_EXTENSIONS OFF)
+-
+ if(NOT CMAKE_BUILD_TYPE)
+- set(CMAKE_BUILD_TYPE Release)
++  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+ endif()
+-
+-enable_testing()
+-
+-# ---- 核心自检: 只依赖自己的代码 ----
+-# 测试源还是空文件时不要生成目标, 否则链接阶段会因为找不到 main 直接失败
+-file(SIZE "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_ekf_synth.cpp" EKF_TEST_SIZE)
+-file(SIZE "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_world_frame.cpp" WF_TEST_SIZE)
+-
+-if(EKF_TEST_SIZE GREATER 0)
+-    add_executable(test_ekf_synth tests/test_ekf_synth.cpp src/ekf9.cpp src/tracker.cpp)
+-    target_include_directories(test_ekf_synth PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+-    add_test(NAME ekf_synth COMMAND test_ekf_synth)
++option(BUILD_APP "Build the video application (requires OpenCV and ONNX Runtime)" ON)
++option(BUILD_VISION_TESTS "Build pose, covariance and configuration tests" ON)
++include(CTest)
++add_library(rm_state src/ekf9.cpp src/tracker.cpp src/imu_series.cpp src/world_frame.cpp src/frame_timeline.cpp)
++target_include_directories(rm_state PUBLIC include)
++target_compile_options(rm_state PRIVATE -Wall -Wextra -Wpedantic)
++if(BUILD_TESTING)
++  foreach(name ekf_synth world_frame covariance)
++    add_executable(test_${name} tests/test_${name}.cpp)
++    target_link_libraries(test_${name} PRIVATE rm_state)
++    add_test(NAME ${name} COMMAND test_${name})
++  endforeach()
+ endif()
+-
+-if(WF_TEST_SIZE GREATER 0)
+-    add_executable(test_world_frame tests/test_world_frame.cpp src/imu_series.cpp src/world_frame.cpp)
+-    target_include_directories(test_world_frame PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+-    add_test(NAME world_frame COMMAND test_world_frame)
++if(BUILD_APP OR BUILD_VISION_TESTS)
++  find_package(OpenCV REQUIRED COMPONENTS core calib3d imgproc videoio highgui dnn)
++  add_library(rm_pose src/camera.cpp src/pnp_solver.cpp src/pose_estimator.cpp src/w3_config_loader.cpp src/state_visualizer.cpp)
++  target_include_directories(rm_pose PUBLIC ${OpenCV_INCLUDE_DIRS})
++  target_link_libraries(rm_pose PUBLIC rm_state ${OpenCV_LIBS})
++  target_compile_options(rm_pose PRIVATE -Wall -Wextra -Wpedantic)
++  if(BUILD_TESTING AND BUILD_VISION_TESTS)
++    add_executable(test_pose tests/test_pose.cpp)
++    target_link_libraries(test_pose PRIVATE rm_pose)
++    add_test(NAME pose COMMAND test_pose)
++  endif()
++  add_executable(evaluate_reprojection tools/evaluate_reprojection.cpp)
++  target_link_libraries(evaluate_reprojection PRIVATE rm_pose)
+ endif()
+-
+-# ---- 主程序: 依赖 OpenCV + ONNX Runtime ----
+-find_package(OpenCV QUIET)
+-
+-set(ONNXRUNTIME_ROOT "$ENV{HOME}/onnxruntime")
+-find_path(ONNXRUNTIME_INCLUDE_DIR onnxruntime_cxx_api.h PATHS ${ONNXRUNTIME_ROOT}/include)
+-find_library(ONNXRUNTIME_LIBRARY onnxruntime PATHS ${ONNXRUNTIME_ROOT}/lib)
+-
+-if(OpenCV_FOUND AND ONNXRUNTIME_INCLUDE_DIR AND ONNXRUNTIME_LIBRARY)
+-file(GLOB RM_WEEK3_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp")
+-list(REMOVE_ITEM RM_WEEK3_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/main_w3.cpp)
+-
+-add_executable(rm_week3 ${RM_WEEK3_SOURCES} src/main_w3.cpp)
+-target_include_directories(rm_week3 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${OpenCV_INCLUDE_DIRS} ${ONNXRUNTIME_INCLUDE_DIR})
+-target_link_libraries(rm_week3 ${OpenCV_LIBS} ${ONNXRUNTIME_LIBRARY})
+-
+-#运行时自动找到libonnxruntime.so
+-set_target_properties(rm_week3 PROPERTIES BUILD_RPATH "${ONNXRUNTIME_ROOT}/lib")
+-else()
+-message(WARNING "未找到 OpenCV/ONNX Runtime,只编译核心自检,跳过rm_week3")
++if(BUILD_APP)
++  set(ONNXRUNTIME_ROOT "$ENV{HOME}/onnxruntime" CACHE PATH "ONNX Runtime release root")
++  find_path(ONNXRUNTIME_INCLUDE_DIR onnxruntime_cxx_api.h HINTS ${ONNXRUNTIME_ROOT}/include)
++  find_library(ONNXRUNTIME_LIBRARY onnxruntime HINTS ${ONNXRUNTIME_ROOT}/lib)
++  if(NOT ONNXRUNTIME_INCLUDE_DIR OR NOT ONNXRUNTIME_LIBRARY)
++    message(FATAL_ERROR "ONNX Runtime missing. Set -DONNXRUNTIME_ROOT=/path, or explicitly disable BUILD_APP.")
++  endif()
++  add_executable(rm_week3 src/main_w3.cpp src/nn_detector.cpp src/traditional_detector.cpp src/number_classifier.cpp src/visualizer.cpp)
++  target_include_directories(rm_week3 PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
++  target_link_libraries(rm_week3 PRIVATE rm_pose ${ONNXRUNTIME_LIBRARY})
++  set_target_properties(rm_week3 PROPERTIES BUILD_RPATH "${ONNXRUNTIME_ROOT}/lib")
++  target_compile_options(rm_week3 PRIVATE -Wall -Wextra -Wpedantic)
+ endif()
+--- a/README.md
++++ b/README.md
+@@ -1,39 +1,116 @@
+-# 第三周整车状态估计
++# 第三周：装甲板位姿与整车状态估计
+ 
+-构建与自检：
++C++17 / CMake。默认 NN 检测，也支持第二周的传统灯条检测。滤波器使用 11 维状态：
++`[cx,vx,cy,vy,za,vz,theta,omega,r,dr,dh]`。`dr`、`dh` 分别是奇数板槽与偶数板槽的半径差、高度差。
++`ekf9.hpp/cpp` 保留旧文件名以兼容第二周/原测试，实际类为 `VehicleEkf`，状态维数是 11。
+ 
+-```sh
+-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
++## 依赖和构建
++
++Ubuntu/WSL：
++
++```bash
++sudo apt update
++sudo apt install build-essential cmake libopencv-dev python3-numpy python3-matplotlib
++```
++
++另外安装 Linux x86_64 ONNX Runtime C/C++ release，并将解压目录传给 CMake：
++
++```bash
++cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DONNXRUNTIME_ROOT="$HOME/onnxruntime"
+ cmake --build build -j4
+ ctest --test-dir build --output-on-failure
+ ```
+ 
+-处理这份视频（默认 NN 检测，`--method trad` 可改用传统检测）：
++已验证环境：GCC 15.2.0、OpenCV 4.10.0、ONNX Runtime 1.20.1、Python 3.14.4。
++需要以下输入文件：`data/test.avi`、`data/imu.txt`、`models/Infantry-v8n.onnx`，传统方案还需 `models/mlp.onnx`。
++模型与原第二周作业一致。大文件未纳入源码提交；重新 clone 后需按此目录结构放入题目提供的文件。
++本数据视频 SHA-256：`864f7d83000885beee606c2dec2025da5bfe6cf6b91350b77d34d33b04716c3f`；
++IMU SHA-256：`950b2695188565207fc606c201ca013125f9e632623fb6a6f10a26a49b6c9c00`。
+ 
+-```sh
+-./build/rm_week3 data/test.avi --imu data/imu.txt --camera camera.yaml \
+-  --out results/overlay_week3.avi --csv results/states_week3.csv
+-python3 tools/plot_states.py results/states_week3.csv
++缺失应用依赖会使配置失败。只运行不依赖 OpenCV/ONNX Runtime 的核心测试时，必须明确选择：
++
++```bash
++cmake -S . -B build-core -DBUILD_APP=OFF -DBUILD_VISION_TESTS=OFF
++cmake --build build-core -j4
++ctest --test-dir build-core --output-on-failure
+ ```
+ 
+-默认 `--time-mode imu-index` 按本数据的录制序号将第 `i` 帧配第 `i` 条 IMU 时间，再按 `camera.yaml` 中的 `img_imu_offset=-0.009` 秒插值姿态。当前 0.20 m 半径初值下，531 帧与 531 条 IMU 配合使用时，完整 NN 运行有 463 帧匹配成功（501 帧有可用量测）。该 AVI 头部标称的 30 fps 与 IMU 的约 24.09 Hz 不符；先前按 AVI 时间运行只有 205 帧匹配成功。因此不要把容器帧率当作已核实的采集帧率。
++## 处理视频与输出
+ 
+-其他具有可信视频时间戳的数据可用 `--time-mode video --video-start-time <秒>`。起始时间指首帧在 IMU 时钟上的图像采集时间；仅提供 `--video-start-time` 也会选择 video 模式。该模式输出采用视频标称帧率，若视频时间超出 IMU 覆盖范围会以非零状态退出。
+-
+-当前默认输出还绘制检测角点、分类和单板 PnP 信息；需要清爽的四板重投影和右上角状态时，加 `--no-debug-detections`。
+-
+-可用 `--imu-offset <秒>` 和 `--plate-radius <米>` 临时覆盖配置，用相同数据比较假设，避免反复修改 YAML。CSV 额外记录更新前的重投影误差和高度残差，可用以下命令汇总：
+-
+-```sh
+-python3 tools/analyze_tracking.py results/states_week3.csv
++```bash
++./build/rm_week3 data/test.avi --imu data/imu.txt --camera camera.yaml \
++  --method nn --time-mode imu-index \
++  --detection-cache results/revision/nn_detections.cache \
++  --out results/revision/submission_nn.avi --csv results/revision/submission_nn.csv
++python3 tools/plot_states.py results/revision/submission_nn.csv
++python3 tools/analyze_tracking.py results/revision/submission_nn.csv
+ ```
+ 
+-批量诊断可加 `--no-video`，只生成 CSV，节省视频编码时间与磁盘空间。
++视频右上角显示全部 11 项状态，四种颜色表示四个固定板槽；细线中包含不可见面的模型预测。
++`--debug-detections` 可另画检测和单板解算信息，默认只画整车重投影。
++CSV 同时记录更新前/后的重投影、NIS、量测/融合数量、初始化/重捕、IMU 边界保持以及 P 的对角项。
++曲线包含所有状态及模型条件下的 ±2σ，重捕时分段，不把不同参考板的角度强接起来。
++每次运行生成同名 `*.csv.meta.json`，保存输入指纹、时间来源、噪声先验、运行条件和外参假设。
+ 
+-更新前重投影残差反映预测模型与检测角点的一致程度，受单帧运动影响，不能当作跟踪精度或用来单独证明时间偏移、四板几何的真实值。
++可用 `--method trad` 切换传统检测；`--no-video` 只输出 CSV，`--max-frames N` 用于短片检查。
++传统检测单独采用 `traditional_corner_sigma_px=3.0`、位置下限 0.02 m、yaw 下限 5°；
++NN 默认对应为 1.5 px、0.01 m、3°。这些是与检测方式对应的噪声先验，不是实测精度结论。
++`--imu-offset` 和 `--plate-radius` 可覆盖配置，半径限制与滤波器使用相同的配置范围。
++缓存只保存原始检测，不保存 PnP 或滤波结果；视频/模型/方法/颜色不匹配时拒绝复用。
++修改检测器代码或阈值后应删除旧缓存或更换缓存文件名。
+ 
+-`camera.yaml` 中的 `R_ci` 仅表示当前假定的轴向关系，`t_ic` 默认零平移；四板半径差和高度差也暂为零。得到实测安装外参、目标装甲板几何后应更新这些值。量测协方差目前依据重投影误差、距离和板宽做针孔近似，并设有噪声下限；没有角点真值，不能将它视为已标定的协方差。
++## 时间和坐标约定
+ 
+-`plate_radius` 当前为 0.20 m，是未标定机械尺寸时的初值。视频中估计半径收敛到约 0.246 m，不能仅凭更新前重投影残差断定真实半径；完整参数对比和局限见 `results/diagnostics_week3.md`。
++IMU：每行 `timestamp_s qw qx qy qz`，假定四元数为 body→world 主动旋转；
++格式错误、重复/倒序时间、零四元数都会报错，不排序或跳过记录来掩盖序号错误。
++相机轴为右/下/前，IMU 轴假定前/左/上，`R_ci` 实际表示 camera→IMU 的轴向映射。
++世界点为 `R_iw * (R_ci * p_camera + t_ic)`，长度单位为米。
++本数据未提供自身平移；当前参考系假定 IMU 原点不平移，不能解释为具备场地绝对定位。
+ 
+-第二周的检测器、数字分类、PnP 与本周共用相同源码及实拍相机配置。两周的 `data/test.avi` 和 NN 模型相同；第二周输出的 `Armor` 四角顺序为左上、右上、右下、左下，本周将其用于 PnP、世界系量测及四板跟踪。第二周 `truth/img*.md` 只对应仿真图片，不能作为这段实拍视频的真值。按当前源码重跑第二周视频，传统检测有检出的帧为 409/531，NN 为 531/531；历史日志中的传统检测率不代表当前实现。
++统一查询式：`t_query = t_image + img_imu_offset`，题目给定 `img_imu_offset=-0.009 s`。
++在 IMU 两侧样本间进行最短弧 SLERP，不能对四元数分量直接线性插值或对欧拉角直接相减。
++
++本 AVI 是 531 帧、标称 30 fps；531 条 IMU 覆盖约 22.00 s（24.086 Hz）。
++默认 `imu-index` 仅采用“图像 i 的时间等于第 i 条 IMU 时间”的未验证假设，不代表录制对应关系已经证实。
++该模式首帧查询早于第一条 IMU 9 ms，只能保持第一条姿态；CSV/元数据明确记录了这 1 帧。
++其他超出 IMU 覆盖范围的帧报错。输出视频按平均采集间隔写入，CSV 保留各帧实际使用的非均匀时间。
++
++获得真实图像时间戳后，推荐提供：
++
++```csv
++frame,t_image_s
++0,0.520
++1,0.562
++2,0.603
++```
++
++以上只是格式示例，实际文件必须覆盖全部帧。运行 `--frame-times data/frame_times.csv` 会自动选择 `timestamps` 模式。
++对于具有可信容器时间的数据，可选择 `--time-mode video --video-start-time <首帧在IMU时钟上的时间>`。
++任何模式都不会由程序自行宣称绝对同步已经验证。
++
++## 位姿、协方差与整车模型
++
++先取 IPPE 两组候选，检查四角正深度和内法线，再分别做带安装姿态软先验的 LM 拟合。
++普通步兵装甲板内法线 pitch 的机械先验为 -15°，pitch/滚转先验标准差均为 5°，允许未标定外参和小幅车体倾斜。
++该角度来自普通装甲板安装模型，不是对本车做出的实测标定；可在 YAML 调整，或关闭 `constrain_plate_pitch`。
++由白化像素/先验残差的 Jacobian 得到位姿参数协方差，变换为完整 `[x,y,z,yaw]` 协方差，保留交叉项。
++噪声下限和 IMU 姿态标准差是可配置先验，不能当成已标定的实际误差。
++
++车中心、高度、朝向采用短时恒速/恒角速度模型；半径与两组几何差缓慢变化。
++每帧对四个固定板槽做几何门控、马氏距离排序和一对一匹配，再将同帧量测联合更新。
++观测之间共享的 IMU 姿态误差进入 R 的非对角块，避免把同一份姿态当成多份独立证据。
++新息中的角度差折回一个周期。P 用 Joseph 形式更新，检查对称正定性；拒绝非法协方差和非物理半径更新。
++普通切板不重置整车状态；失配时预测，连续 12 帧无融合后重捕，超过 0.2 s 的帧间断重新建立轨迹。
++
++## 验证与交付
++
++```bash
++python3 tools/check_cli.py
++```
++
++该集成检查要求完整检测缓存已生成，验证参数拒绝、真实时间戳入口、覆盖边界和缓存/原始检测结果一致。
++四项 CTest 验证可见板跟踪、动态 IMU/SLERP、两组几何、相关量测联合更新、合成 NIS/NEES、位姿双解及像素协方差传播。
++
++修改前后对比及限制见 [results/revision/validation.md](results/revision/validation.md)。
++报告草稿见 [视觉第三周作业_姓名.md](视觉第三周作业_姓名.md)，提交前填写姓名与真实仓库/PR/commit 信息。
++公开方案来源及许可见 [docs/OPEN_SOURCE_REFERENCES.md](docs/OPEN_SOURCE_REFERENCES.md)。
+--- a/camera.yaml
++++ b/camera.yaml
+@@ -57,8 +57,7 @@
+ #  r 是 0 号参考板半径;第 j 块实际半径 r_j = r + plate_radius_offset[j]
+ #  高度 z_j = za + plate_dh[j]。相位按绕车一周 0/90/180/270 排布。
+ #  半径初值取中性先验 0.20m,不是实测值:留出"由数据收敛到真值"的余地。
+-#  本视频整段 EKF 从 0.200 收敛到约 0.246,该收敛过程本身就是可辨识性的证据;
+-#  若把初值直接设成收敛值,等于用答案当先验,这条论证就不成立了。
++#  半径稳定仅说明该模型下的估计趋稳，不能证明实际机械尺寸或可辨识性。
+ #  高度差没有可靠真值，暂保持零。
+ #  若确认目标车两组交替半径/两种安装高度,只改这两个数组,不改代码。
+ plate_radius: 0.20
+@@ -80,3 +79,29 @@
+ 
+ #  1 = 观测里加"板方位角"这一行(推荐);0 = 严格只用 3 维位置观测
+ use_theta_obs: 1
++
++# 11-state model adds dr=r_odd-r_even and dh=z_odd-z_even as estimated states.
++estimate_pair_geometry: 1
++radius_min: 0.12
++radius_max: 0.40
++
++# Ordinary infantry plate installation prior (inward normal, world +z upwards).
++# Assumed mechanical pitch, NOT a calibration result for this particular robot.
++# Shared by constrained pose fitting and four-plate reprojection.
++plate_inward_pitch_deg: -15.0
++constrain_plate_pitch: 1
++plate_pitch_sigma_deg: 5.0
++plate_roll_sigma_deg: 5.0
++
++# Detector/model uncertainty priors; full covariance is propagated through the pixel Jacobian.
++# Floors represent unmodelled detector/calibration error. They are not ground-truth calibration.
++corner_sigma_px: 1.5
++position_noise_floor_m: 0.01
++yaw_noise_floor_deg: 3.0
++imu_attitude_sigma_deg: 0.3
++
++# Traditional threshold/dilation/rectangle endpoints are less precise than NN keypoints.
++# Separate priors; not calibrated ground-truth detector errors.
++traditional_corner_sigma_px: 3.0
++traditional_position_floor_m: 0.02
++traditional_yaw_floor_deg: 5.0
+--- a/docs/OPEN_SOURCE_REFERENCES.md
++++ b/docs/OPEN_SOURCE_REFERENCES.md
+@@ -0,0 +1,24 @@
++# 公开方案参考与实现边界
++
++本项目以原作业代码为基础重新实现相关算法，不引入 ROS 或开源仓库作为运行依赖。
++
++1. 同济大学 SuperPower，`sp_vision_25`，MIT，检查版本
++   `bd9f5e798fa3c6dd3b483ae6627796afb41c608d`。
++   [solver.cpp](https://github.com/TongjiSuperPower/sp_vision_25/blob/bd9f5e798fa3c6dd3b483ae6627796afb41c608d/tasks/auto_aim/solver.cpp)
++   对普通装甲板使用安装 pitch 先验优化 yaw，重投影使用相同的安装几何；
++   [target.cpp](https://github.com/TongjiSuperPower/sp_vision_25/blob/bd9f5e798fa3c6dd3b483ae6627796afb41c608d/tasks/auto_aim/target.cpp)
++   使用 `[x,vx,y,vy,z,vz,a,w,r,l,h]` 的 11 维状态表示两组半径和高度。
++   本项目参考这两点，采用固定板槽、11 维整车模型，并将安装姿态改为带标准差的软先验。
++   原因是本作业的 camera/IMU 精细安装外参未提供，实拍中可见数度的残余滚转，硬约束会导致量测被大量拒绝。
++2. Chen Jun，`rm_auto_aim`，MIT，检查版本
++   `f244d0e296327d73171311ec50bf5f88856077b1`。
++   [tracker.cpp](https://github.com/chenjunnn/rm_auto_aim/blob/f244d0e296327d73171311ec50bf5f88856077b1/armor_tracker/src/tracker.cpp)
++   区分跟踪、暂时丢失、丢失，切板时处理另一组半径和高度。
++   本项目保留四个固定板槽，切板通过关联选择槽号，失配时预测，连续失配后重捕。
++   因此不需要在普通切板时重写整车角度或交换协方差。
++
++本项目另外实现：从像素 Jacobian 传播完整位置/yaw 协方差；同帧共享 IMU 误差的联合更新；
++更新前创新的 NIS；在有已知真值的 Monte Carlo 实验中计算 NEES。实际视频没有真值，未计算实际视频 NEES。
++公开实现中的噪声常数、外参、板尺寸以及诊断阈值没有直接移植到本视频。
++
++上述项目的 MIT 版权与许可文本保存在 `docs/licenses/`。
+--- a/docs/licenses/ChenJun_MIT.txt
++++ b/docs/licenses/ChenJun_MIT.txt
+@@ -0,0 +1,21 @@
++MIT License
++
++Copyright (c) 2022 ChenJun
++
++Permission is hereby granted, free of charge, to any person obtaining a copy
++of this software and associated documentation files (the "Software"), to deal
++in the Software without restriction, including without limitation the rights
++to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++copies of the Software, and to permit persons to whom the Software is
++furnished to do so, subject to the following conditions:
++
++The above copyright notice and this permission notice shall be included in all
++copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++SOFTWARE.
+--- a/docs/licenses/TongjiSuperPower_MIT.txt
++++ b/docs/licenses/TongjiSuperPower_MIT.txt
+@@ -0,0 +1,21 @@
++MIT License
++
++Copyright (c) 2025 TongjiSuperPower
++
++Permission is hereby granted, free of charge, to any person obtaining a copy
++of this software and associated documentation files (the "Software"), to deal
++in the Software without restriction, including without limitation the rights
++to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++copies of the Software, and to permit persons to whom the Software is
++furnished to do so, subject to the following conditions:
++
++The above copyright notice and this permission notice shall be included in all
++copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++SOFTWARE.
+--- a/include/detection_cache.hpp
++++ b/include/detection_cache.hpp
+@@ -0,0 +1,49 @@
++#pragma once
++#include "types.hpp"
++#include <cstdint>
++#include <filesystem>
++#include <fstream>
++#include <iomanip>
++#include <sstream>
++#include <stdexcept>
++namespace rmv {
++inline std::string fileFingerprint(const std::string& path) {
++    std::ifstream f(path,std::ios::binary);if(!f) throw std::runtime_error("Cannot fingerprint "+path);
++    std::uint64_t h=14695981039346656037ull;char b[65536];
++    while(f.read(b,sizeof(b))||f.gcount()) for(std::streamsize k=0;k<f.gcount();++k) {h^=static_cast<unsigned char>(b[k]);h*=1099511628211ull;}
++    std::ostringstream out;out<<std::hex<<h;return out.str(); // Cache identity, not a cryptographic checksum.
++}
++inline std::vector<std::vector<Armor>> readDetectionCache(const std::string& path,const std::string& signature) {
++    std::ifstream f(path);std::string header;std::getline(f,header);
++    if(header!=signature) throw std::runtime_error("Detection cache signature mismatch: "+path);
++    std::vector<std::vector<Armor>> result;int frame,count;
++    while(f>>frame>>count) {
++        if(frame!=(int)result.size() || count<0 || count>100) throw std::runtime_error("Invalid detection cache frame");
++        std::vector<Armor> detections;
++        for(int i=0;i<count;++i) {
++            Armor a;int big;if(!(f>>a.number>>big>>a.confidence>>a.label)) throw std::runtime_error("Truncated detection cache");
++            a.size=big?ArmorSize::BIG:ArmorSize::SMALL;a.corners.resize(4);
++            for(auto& p:a.corners) if(!(f>>p.x>>p.y)) throw std::runtime_error("Truncated cached corners");
++            detections.push_back(a);
++        }result.push_back(detections);
++    }
++    if(!f.eof()) throw std::runtime_error("Invalid detection cache tail");
++    return result;
++}
++inline void writeDetectionCache(const std::string& path,const std::string& signature,
++                                const std::vector<std::vector<Armor>>& frames) {
++    auto parent=std::filesystem::path(path).parent_path();if(!parent.empty()) std::filesystem::create_directories(parent);
++    std::ofstream f(path+".tmp");if(!f) throw std::runtime_error("Cannot write detection cache");
++    f<<signature<<'\n'<<std::setprecision(9);
++    for(size_t n=0;n<frames.size();++n) {
++        f<<n<<' '<<frames[n].size()<<'\n';
++        for(const auto& a:frames[n]) {
++            f<<a.number<<' '<<(a.size==ArmorSize::BIG)<<' '<<a.confidence<<' '<<a.label;
++            for(auto p:a.corners) f<<' '<<p.x<<' '<<p.y;
++            f<<'\n';
++        }
++    }
++    f.flush();if(!f) throw std::runtime_error("Failed writing detection cache");f.close();
++    std::filesystem::rename(path+".tmp",path);
++}
++}
+--- a/include/ekf9.hpp
++++ b/include/ekf9.hpp
+@@ -1,45 +1,39 @@
+-#pragma once 
+-//9维ekf整车状态估计
+-#include "math3d.hpp"
++#pragma once
+ #include "w3_types.hpp"
+ #include <array>
+-using namespace std;
+-
+-namespace rmv
+-{
+-    class Ekf9
+-    {
+-        public:
+-         static constexpr int N = 9;
+-         enum Index
+-         {
+-            CX = 0,VX = 1,CY = 2,VY = 3,ZA = 4,VZ = 5,TH = 6,OM = 7,R = 8
+-         };
+-         explicit Ekf9(const PlateGeometry& geo,bool use_theta_obs = true);
+-
+-         void initFromMeasurement(const Vec3& p_w,double theta_meas,int plate_idx,double t,const double* variance = nullptr);
+-
+-         void predict(double dt,double sigma_a = 0.8,double sigma_alpha = 2.0,double sigma_v = 0.4);
+-
+-         //量测更新：z为（x,y,z)或(x,y,z,theta)，由with_theta决定
+-         bool update(int plate_idx,const double* z,int dim,const double* variance = nullptr);
+-
+-         double mahalanobis(int plate_idx,const double* z,int dim,const double* variance = nullptr) const;
+-
+-         const EkfState& state() const {return state_;}
+-         double cov(int i,int j) const {return P_[i*N+j];}
+-         bool useThetaObs()const {return use_theta_obs_;}
+-         int obsDim() const {return use_theta_obs_?4:3;}
+-        private:
+-        //计算h(x)和雅可比H
+-        void observe(int plate_idx,double* h,double* H,int& dim) const;
+-
+-        void setStateFromVector(const double* x);
+-        void getStateVector(double* x) const;
+-        EkfState state_;
+-        array<double,N*N>P_{};
+-        PlateGeometry geo_;
+-        bool use_theta_obs_ = true;
+-        double t_ = 0.0;
+-    };
+-}       //namespace rmv
++#include <vector>
++namespace rmv {
++class VehicleEkf {
++public:
++    static constexpr int N=11;
++    enum Index { CX,VX,CY,VY,ZA,VZ,TH,OM,R,DR,DH };
++    explicit VehicleEkf(const PlateGeometry&,bool use_theta_obs=true);
++    void initFromMeasurement(const Vec3&,double theta,int plate,double t,const double* covariance=nullptr);
++    void predict(double dt,double sigma_a=.8,double sigma_alpha=2.,double sigma_z=.4);
++    // covariance always has stride 4, including in position-only mode.
++    bool update(int plate,const double* z,int dim,const double* covariance=nullptr);
++    bool updateBatch(const std::vector<PlateObservation>&);
++    double mahalanobis(int plate,const double* z,int dim,const double* covariance=nullptr) const;
++    void observe(int plate,double* h,double* H,int& dim) const;
++    const EkfState& state() const { return state_; }
++    double cov(int i,int j) const { return P_[i*N+j]; }
++    bool covarianceHealthy() const;
++    bool useThetaObs() const { return use_theta_obs_; }
++    int obsDim() const { return use_theta_obs_?4:3; }
++    double lastNis() const { return last_nis_; }
++    int lastDof() const { return last_dof_; }
++private:
++    void getStateVector(double*) const;
++    void setStateFromVector(const double*);
++    bool validGeometry(const double*) const;
++    bool innovation(const std::vector<PlateObservation>&,double* residual,double* H,
++                    double* noise,double* inverseS,int& dim) const;
++    EkfState state_;
++    std::array<double,N*N> P_{};
++    PlateGeometry geo_;
++    bool use_theta_obs_;
++    double last_nis_=0;
++    int last_dof_=0;
++};
++using Ekf9=VehicleEkf; // Compatibility for earlier coursework; now eleven states.
++}
+--- a/include/frame_timeline.hpp
++++ b/include/frame_timeline.hpp
+@@ -0,0 +1,7 @@
++#pragma once
++#include <string>
++#include <vector>
++namespace rmv {
++// CSV header frame,t_image_s; exact sequential indices and strictly increasing timestamps.
++std::vector<double> loadFrameTimes(const std::string& path);
++}
+--- a/include/measurement.hpp
++++ b/include/measurement.hpp
+@@ -9,8 +9,8 @@
+     inline Vec3 plateWorldPosition(const EkfState& s,int j,const PlateGeometry& g)
+     {
+         const double a = s.theta+deg2rad(g.phase_deg[j]);
+-        const double rj = s.r+g.radius_offset[j];
+-        return {s.cx-rj*cos(a),s.cy-rj*sin(a),s.za+g.dh[j]}; 
++        const double rj = s.r+g.radius_offset[j]+(j%2?s.dr:0.0);
++        return {s.cx-rj*cos(a),s.cy-rj*sin(a),s.za+g.dh[j]+(j%2?s.dh:0.0)};
+     }
+     //第j块板的方位角量测=车体theta+相位
+     inline double plateThetaMeas(const EkfState& s,int j,const PlateGeometry& g)
+@@ -24,4 +24,16 @@
+     {
+         return atan2(n_in_world.y,n_in_world.x);
+     }
++    // Columns: X(right), Y(down), Z(inward). Shared by pose solving and rendering.
++    inline Mat3 plateRotationWorld(double yaw,double pitch)
++    {
++        const Vec3 z(cos(pitch)*cos(yaw),cos(pitch)*sin(yaw),sin(pitch));
++        const Vec3 x(sin(yaw),-cos(yaw),0),y=z.cross(x);
++        Mat3 out;
++        for(int k=0;k<3;++k) {
++            const Vec3 v=k==0?x:(k==1?y:z);
++            out.m[0][k]=v.x;out.m[1][k]=v.y;out.m[2][k]=v.z;
++        }
++        return out;
++    }
+ }   //namespace rmv
+--- a/include/pnp_solver.hpp
++++ b/include/pnp_solver.hpp
+@@ -15,6 +15,8 @@
+     //  输入 armor.corners(像素坐标, 契约序), 输出位置(mm)与重投影自检
+     //  畸变不需要手动 undistort, solvePnP 传入畸变系数后内部处理
+     PoseResult solve(const Armor& armor) const;
++    // IPPE's two front-facing solutions can both have positive depth.
++    std::vector<PoseResult> solveCandidates(const Armor& armor) const;
+ 
+ private:
+     CameraParams params_;
+--- a/include/pose_estimator.hpp
++++ b/include/pose_estimator.hpp
+@@ -0,0 +1,22 @@
++#pragma once
++#include "pnp_solver.hpp"
++#include "world_frame.hpp"
++#include "w3_types.hpp"
++namespace rmv {
++struct PoseMeasurement {
++    bool ok=false;
++    PoseResult pose;
++    Measurement measurement;
++    double raw_rms_px=0,raw_pitch_deg=0;
++    int candidates=0;
++};
++class PoseEstimator {
++public:
++    PoseEstimator(const CameraParams& camera,const W3Config& config);
++    PoseMeasurement estimate(const Armor&,double t,const WorldFrame&) const;
++private:
++    CameraParams camera_;
++    W3Config config_;
++    PnpSolver pnp_;
++};
++}
+--- a/include/small_matrix.hpp
++++ b/include/small_matrix.hpp
+@@ -0,0 +1,40 @@
++#pragma once
++#include <algorithm>
++#include <cmath>
++namespace rmv::small {
++// Cholesky on a normalized correlation matrix avoids metre/radian scaling issues.
++inline bool inverseSpd(const double* a,int n,double* inverse) {
++    if(n<1 || n>16) return false;
++    double scale[16],l[256]={},y[16],x[16];
++    for(int i=0;i<n;++i) {
++        if(!std::isfinite(a[i*n+i]) || a[i*n+i]<=0) return false;
++        scale[i]=std::sqrt(a[i*n+i]);
++    }
++    for(int i=0;i<n;++i) for(int j=0;j<=i;++j) {
++        if(!std::isfinite(a[i*n+j]) || !std::isfinite(a[j*n+i])) return false;
++        if(std::abs(a[i*n+j]-a[j*n+i])>1e-8*scale[i]*scale[j]) return false;
++        double s=.5*(a[i*n+j]+a[j*n+i])/(scale[i]*scale[j]);
++        for(int k=0;k<j;++k) s-=l[i*n+k]*l[j*n+k];
++        if(i==j) { if(s<=1e-13) return false; l[i*n+j]=std::sqrt(s); }
++        else l[i*n+j]=s/l[j*n+j];
++    }
++    for(int c=0;c<n;++c) {
++        for(int i=0;i<n;++i) {
++            double s=(i==c?1.:0.);
++            for(int k=0;k<i;++k) s-=l[i*n+k]*y[k];
++            y[i]=s/l[i*n+i];
++        }
++        for(int i=n-1;i>=0;--i) {
++            double s=y[i];
++            for(int k=i+1;k<n;++k) s-=l[k*n+i]*x[k];
++            x[i]=s/l[i*n+i]; inverse[i*n+c]=x[i]/(scale[i]*scale[c]);
++        }
++    }
++    return true;
++}
++inline double chiSquareGate(int dof) {
++    constexpr double gates[17]={0,10.828,13.816,16.266,18.467,20.515,22.458,24.322,
++        26.124,27.877,29.588,31.264,32.909,34.528,36.123,37.697,39.252};
++    return gates[std::clamp(dof,1,16)]; // 99.9% upper quantile
++}
++}
+--- a/include/w3_types.hpp
++++ b/include/w3_types.hpp
+@@ -1,81 +1,59 @@
+ #pragma once
+-#include"math3d.hpp"
+-#include<array>
+-#include<string>
+-using namespace std;
+-
+-namespace rmv
+-{
+-    //9维状态
+-    //x=[cx,vx,cy,vy,za,vz,theta,omega,r]
+-    //(cx,cy)车体中心水平位置
+-    //za     装甲板基准高度
+-    //theta  车体自转角，从板指向车心
+-    //omega  自转角速度
+-    //r      板中心到车心的距离
+-    struct EkfState
+-    {
+-        double cx = 0.0, vx = 0.0;
+-        double cy = 0.0, vy = 0.0;
+-        double za = 0.0, vz = 0.0;
+-        double theta = 0.0, omega = 0.0;
+-        double r = 0.0;
+-    };
+-
+-    //四块板的安装几何
+-    //状态里的r是0号参考板的半径；第j块实际半径=r+radius_offset[j]
+-    //状态里的za是基准高度；第j块是实际高度=za+dh[j]
+-    struct PlateGeometry
+-    {
+-        double radius = 0.20;
+-        array<double ,4> radius_offset{{0.0,0.0,0.0,0.0}};
+-        array<double ,4> phase_deg{{0.0,90.0,180.0,270.0}};
+-        array<double ,4> dh{{0.0,0.0,0.0,0.0}};
+-    };
+-
+-    //一块板的一次量测
+-    struct Measurement
+-    {
+-        Vec3 p_w;               //板中心世界坐标
+-        double theta = 0.0;     //该版的方位角
+-        bool is_big = false;    //是否是大板
+-        int target_id = -1;     //同一辆车的装甲板类别
+-        array<double,4> variance{{0.03*0.03,0.03*0.03,0.10*0.10,deg2rad(3.0)*deg2rad(3.0)}};
+-    };
+-    //跟踪器每帧诊断信息
+-    struct TrackerDiag
+-    {
+-        int matched_j = -1;
+-        int matched_meas = -1;
+-        // 板槽 j 对应本帧量测索引；-1 表示未匹配。
+-        array<int,4> matched_meas_by_plate{{-1,-1,-1,-1}};
+-        int n_meas = 0;
+-        int n_matched = 0;
+-        bool reinit = false;
+-        bool skip = false; 
+-        EkfState predicted;
+-        bool has_prediction = false;
+-    };
+-
+-    //工程配置
+-    struct W3Config
+-    {
+-        double K[9]={2362.2795952460974,0.0,679.17513921636282,0.0,2336.1916035376717,529.06858905837635,0.0,0.0,1.0};
+-        double D[5]={-0.098561592108101559, 0.11173066531932681,-0.0038352945867108721, -0.0020421443354436304, 0.0};
+-
+-        
+-        //相机轴->IMU轴的约定
+-        double R_ci[9] = {0.0, 0.0, 1.0,-1.0, 0.0, 0.0,0.0, -1.0, 0.0};
+-        //相机原点在 IMU 坐标系中的位置, 单位 m
+-        double t_ic[3] = {0.0, 0.0, 0.0};
+-        //图像时间戳+img_imu_offset = 查询IMU的时间
+-        double img_imu_offset = -0.009;
+-
+-        //是否在观测里加入方位角行
+-        int use_theta_obs = 1;
+-        PlateGeometry plate;
+-
+-        string imu_path;        //imu.txt路径
+-    };
+-
+-}   //namespace rmv
++#include "math3d.hpp"
++#include <array>
++#include <limits>
++#include <string>
++namespace rmv {
++// Fixed slots; observing a new plate does not reset the car reference.
++// [cx,vx,cy,vy,za,vz,theta,omega,r,dr,dh]. Odd slots use r+dr and za+dh.
++struct EkfState {
++    double cx=0,vx=0,cy=0,vy=0,za=0,vz=0,theta=0,omega=0,r=0,dr=0,dh=0;
++};
++struct PlateGeometry {
++    double radius=.20, radius_min=.12, radius_max=.40, inward_pitch_deg=-15.;
++    bool estimate_pair_geometry=true;
++    std::array<double,4> radius_offset{{0,0,0,0}}, phase_deg{{0,90,180,270}}, dh{{0,0,0,0}};
++};
++using Covariance4=std::array<double,16>;
++inline Covariance4 diagonalCovariance(double x,double y,double z,double a) {
++    Covariance4 c{}; c[0]=x; c[5]=y; c[10]=z; c[15]=a; return c;
++}
++struct Measurement {
++    Vec3 p_w;
++    double theta=0;
++    bool is_big=false;
++    int target_id=-1;
++    // Independent noise, full row-major covariance in [x,y,z,yaw].
++    Covariance4 covariance=diagonalCovariance(.03*.03,.03*.03,.10*.10,deg2rad(3)*deg2rad(3));
++    // G times unit Gaussian: the SAME attitude error affects all plates in a frame.
++    std::array<double,12> shared_noise{};
++    Covariance4 totalCovariance() const {
++        auto c=covariance;
++        for(int i=0;i<4;++i) for(int j=0;j<4;++j) for(int k=0;k<3;++k)
++            c[i*4+j]+=shared_noise[i*3+k]*shared_noise[j*3+k];
++        return c;
++    }
++};
++struct PlateObservation { int plate=0; Measurement measurement; };
++struct TrackerDiag {
++    int matched_j=-1,matched_meas=-1,n_meas=0,n_matched=0;
++    std::array<int,4> matched_meas_by_plate{{-1,-1,-1,-1}};
++    bool initialization=false,reinit=false,skip=false,has_prediction=false;
++    double nis=std::numeric_limits<double>::quiet_NaN();
++    int nis_dof=0;
++    EkfState predicted;
++};
++struct W3Config {
++    double K[9]={2362.2795952460974,0,679.17513921636282,0,2336.1916035376717,529.06858905837635,0,0,1};
++    double D[5]={-.098561592108101559,.11173066531932681,-.0038352945867108721,-.0020421443354436304,0};
++    double R_ci[9]={0,0,1,-1,0,0,0,-1,0},t_ic[3]={0,0,0};
++    double img_imu_offset=-.009,corner_sigma_px=1.5,position_noise_floor_m=.01;
++    double yaw_noise_floor_deg=3.,imu_attitude_sigma_deg=.3;
++    double plate_pitch_sigma_deg=5.,plate_roll_sigma_deg=5.;
++    double traditional_corner_sigma_px=3.,traditional_position_floor_m=.02,traditional_yaw_floor_deg=5.;
++    bool constrain_plate_pitch=true;
++    int use_theta_obs=1;
++    PlateGeometry plate;
++    std::string imu_path;
++};
++}
+--- a/results/revision/validation.md
++++ b/results/revision/validation.md
+@@ -0,0 +1,82 @@
++# 2026-10-30 修改与实跑验证
++
++输入为题目提供的完整 531 帧视频及 531 条 IMU。原始源码已备份至
++`/home/wang/.cache/rm_week3_revision_20261030/before`，包含 SHA-256 清单。
++旧程序从该备份独立编译并重新处理视频，输出 `baseline_nn.csv`；新程序输出 `submission_nn.csv`。
++检测器源码/模型保持相同，缓存保存全部 794 次原始检测，后续比较复用相同角点。
++
++## 修改
++
++- 11 维整车状态，增加交替半径差 dr 和高度差 dh；保留四个固定板槽，普通切板不重置车心。
++- IPPE 双候选 + 带不确定性的安装 pitch/滚转先验，不再只取单个平面解。
++- 像素/先验 Jacobian 传播完整位置/yaw 协方差，初始化也保留位置/角度相关性。
++- 同帧多板联合融合，共享 IMU 姿态噪声通过 R 的交叉块进入更新。
++- 更新前 NIS、Joseph 协方差更新、正定检查、非法输入拒绝；统一半径机械范围。
++- 真实逐帧时间戳入口，显式记录按序号配对的假设及首帧姿态保持。
++- 全部状态、±2σ、运行元数据、独立原始角点评价器和回归比较脚本。
++
++## 实拍对比
++
++跳过前 30 帧，在相同的 501 帧上比较：
++
++| 指标 | 修改前 | 修改后 |
++| --- | ---: | ---: |
++| 匹配帧 | 463/501 | 463/501 |
++| 全部原始检测的模型重投影 RMS 中位数 | 29.88 px | 22.42 px |
++| 全部原始检测的模型重投影 RMS 90% 分位 | 65.73 px | 55.54 px |
++| 更新前主匹配板 RMS 中位数 | 23.78 px | 20.07 px |
++| 更新前主匹配板 RMS 90% 分位 | 78.61 px | 60.61 px |
++
++全部原始检测指标对每块检测板选择最近的朝前预测板，不用 EKF 是否接纳该量测筛选，避免只评价“容易被接受”的帧。
++两版覆盖相同的 501 帧，检测及评价数量逐帧相同。中位数减少约 24.95%，90% 分位减少约 15.50%。
++这仍是模型与检测的一致性，不是位置/速度的真实误差，也不是带真实板号的身份匹配精度。
++两个版本都匹配成功的共同 433 帧上，更新前主匹配 RMS 中位数 22.42→20.30 px，90% 分位 69.25→61.18 px。
++
++新版本完整处理 531 帧、794 次有效位姿量测，零位姿质量拒绝；初始化 1 次，实际重捕 0 次，531/531 帧协方差检查通过。
++末段 5 秒估计中位数：偶数组半径约 0.2569 m，dr 约 -0.0078 m，dh 约 +0.0215 m。
++这些值依赖当前模型与外参，不当作机械尺寸真值。
++
++传统方案也做完整旧/新复跑。传统与 NN 对应角点的 RMS 差异中位数约 4.00 px（478 对、差异小于 20 px 的样本），
++该比较不是角点真值标定。传统的膨胀与矩形端点存在更大误差，采用单独的 3 px 角点、0.02 m 位置和 5° yaw 噪声先验后，
++跳过前 30 帧的匹配由 322/501 提升到 382/501，重捕由 1 次降为 0 次。
++传统方案存在少量检测/板型错误，质量门仍会拒绝位姿；不以无限增大量测噪声来追求全部接纳。
++主交付采用 NN，传统结果保存为 `submission_trad.avi/csv/png` 供对照。
++
++## 合成与工程检查
++
++- 完整构建与 CTest：4/4 通过；显式核心构建：3/3 通过。
++- 40 个独立 Monte Carlo 试验：更新前 NIS/自由度 1.0031，末帧平均 NEES 10.8871（11 维）。
++- 100 次像素噪声试验：全部解算成功，位置/yaw 四维平均 NEES 4.2301。
++- 残余滚转回归：安装软先验允许数度滚转，避免硬 pitch 约束拒绝真实量测。
++- 参数非法值、半径范围、时间源选择、IMU 覆盖、缓存/原始检测等集成检查通过。
++- 输出视频 1440×1080、24.086 fps，完整解码确认 531 帧；抽查第 30、180、360 帧的四板与全部状态叠加。
++
++初次尝试的硬安装约束在实拍上造成大量量测拒绝，因此未作为最终版本；最终软先验版本重新跑过完整视频。
++合成统计只验证已设噪声/几何假设下的实现，不代表实拍协方差已经标定。
++
++## 复跑
++
++```bash
++cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
++cmake --build build -j4
++ctest --test-dir build --output-on-failure
++./build/rm_week3 --detection-cache results/revision/nn_detections.cache \
++  --out results/revision/submission_nn.avi --csv results/revision/submission_nn.csv
++python3 tools/plot_states.py results/revision/submission_nn.csv
++python3 tools/check_cli.py
++
++./build/evaluate_reprojection results/revision/baseline_nn.csv \
++  results/revision/nn_detections.cache camera.yaml data/imu.txt results/revision/baseline_reprojection.csv 0
++./build/evaluate_reprojection results/revision/submission_nn.csv \
++  results/revision/nn_detections.cache camera.yaml data/imu.txt results/revision/updated_reprojection.csv
++python3 tools/compare_runs.py results/revision/baseline_nn.csv results/revision/submission_nn.csv \
++  results/revision/baseline_reprojection.csv results/revision/updated_reprojection.csv \
++  --output results/revision/comparison.json
++```
++
++## 仍需外部资料确认的条件
++
++逐帧图像时间未提供，保留“图像 i 时间取 IMU 行 i”的未验证假设与题目给定 -9 ms；首帧有一次姿态边界保持。
++相机到 IMU 的精细安装外参、自身平移以及目标实测几何均未提供。程序增加了真实时间戳入口和可配置先验，无法凭软件修改补出这些真值。
++实拍重投影还有残差，尤其在斜视或两块板量测不一致时，不能宣称达到像素级贴合或绝对空间精度。
++当前运行的通过标准是：无跟踪覆盖回退、无重捕、协方差有效，且同一批全部原始检测上的中位数及尾部残差均改善；这些回归标准均通过。
+--- a/src/camera.cpp
++++ b/src/camera.cpp
+@@ -2,6 +2,8 @@
+ 
+ #include <algorithm>
+ #include <cctype>
++#include <cmath>
++#include <iostream>
+ 
+ //  解析敌方颜色字符串(大小写不敏感)
+ bool parseEnemyColor(const std::string& text, EnemyColor& out)
+@@ -21,6 +23,7 @@
+ //  用 OpenCV读yaml, 缺字段时保留默认值
+ bool loadCameraParams(const std::string& path, CameraParams& p)
+ {
++    try {
+     cv::FileStorage fs(path, cv::FileStorage::READ);
+     if (!fs.isOpened()) return false;
+ 
+@@ -38,10 +41,16 @@
+     {
+         std::string color;
+         fs["enemy_color"] >> color;
+-        parseEnemyColor(color, p.enemy_color);
++        if(!parseEnemyColor(color,p.enemy_color)) return false;
+     }
+ 
+-    return !p.camera_matrix.empty() && !p.dist_coeffs.empty();
++    if(p.camera_matrix.rows!=3 || p.camera_matrix.cols!=3 || p.camera_matrix.channels()!=1 ||
++       p.dist_coeffs.rows!=1 || p.dist_coeffs.cols!=5 || p.dist_coeffs.channels()!=1) return false;
++    p.camera_matrix.convertTo(p.camera_matrix,CV_64F);p.dist_coeffs.convertTo(p.dist_coeffs,CV_64F);
++    if(!cv::checkRange(p.camera_matrix)||!cv::checkRange(p.dist_coeffs)) return false;
++    return p.camera_matrix.at<double>(0,0)>0 && p.camera_matrix.at<double>(1,1)>0 &&
++        p.image_width>0 && p.image_height>0 && p.small_width>0 && p.small_height>0 && p.big_width>0 && p.big_height>0;
++    } catch(const cv::Exception& e) {std::cerr<<e.what()<<'\n';return false;}
+ }
+ 
+ //分辨率变化的原因:图像等比缩放后, 像素坐标整体按 s 缩放,
+--- a/src/ekf9.cpp
++++ b/src/ekf9.cpp
+@@ -1,388 +1,161 @@
+ #include "ekf9.hpp"
+ #include "measurement.hpp"
+-#include<cmath>
+-using namespace std;
+-
+-namespace rmv
+-{
+-    namespace
+-    {
+-        //C=A*B: A(ar x ac), B(ac x bc), C(ar x bc)，均按行主序连续存放
+-        void matMul(const double* A,int ar,int ac, const double* B,int bc,double* C)
+-        {
+-            for (int i = 0;i<ar;++i)
+-            {
+-                for(int j = 0;j < bc;++j)
+-
+-                {
+-                    double s = 0.0;
+-                    for(int k = 0;k < ac;++k)
+-                    s+=A[i*ac+k]*B[k*bc+j];
+-                    C[i*bc+j]=s;
+-                }
+-            }
+-
+-        }
+-        //At=A^T: A(r x c) -> At(c x r)
+-        void matT(const double* A,int r,int c,double* At)
+-        {
+-            for(int i = 0;i < r;++i)
+-            {
+-                for(int j = 0;j < c;++j)
+-                At[j*r+i]=A[i*c+j];
+-            }
+-        }
+-        //高斯-约当求逆（列主元）, A(n x n) -> inv(n x n)
+-        bool matInv(const double* A,int n,double* inv)
+-        {
+-            double a[9*9];
+-            for(int i = 0;i < n*n;++i)
+-            a[i] = A[i];
+-            for(int i = 0;i < n;++i)
+-            {
+-                for(int j = 0;j < n;++j)
+-                inv[i*n+j]=(i==j)?1.0:0.0;
+-
+-            }
+-            for(int c = 0;c < n;++c)
+-            {
+-                int piv = c;
+-                for(int r = c + 1;r < n;++r)
+-                {
+-                    if(fabs(a[r*n+c])>fabs(a[piv*n+c])) piv = r;
+-                }
+-                if(fabs(a[piv*n+c])<1e-12)
+-                return false;
+-
+-                if(piv!=c)
+-                {
+-                    for(int k = 0;k < n;++k)
+-                    {
+-                        swap(a[c*n+k],a[piv*n+k]);
+-                        swap(inv[c*n+k],inv[piv*n+k]);
+-                    }
+-                }
+-                const double d = a[c*n+c];
+-                for(int k = 0;k < n;++k)
+-                {
+-                    a[c*n+k]/=d;
+-                    inv[c*n+k]/=d;
+-                }
+-                for(int r = 0;r < n;++r)
+-                {
+-                    if(r==c)
+-                    continue;
+-                    const double f = a[r*n+c];
+-                    if(fabs(f)<1e-18)
+-                    continue;
+-                    for(int k = 0;k < n;++k)
+-                    {
+-                        a[r*n+k]-=f*a[c*n+k];
+-                        inv[r*n+k]-=f*inv[c*n+k];
+-
+-                    }
+-                }
+-            }
+-            return true;
+-        }
+-        //卡方门限：3/4 自由度、99.9%
+-        constexpr double kChi2Gate3 = 16.27;
+-        constexpr double kChi2Gate4 = 18.47;
+-    }   //namespace
+-        Ekf9::Ekf9(const PlateGeometry& geo,bool use_theta_obs):geo_(geo),use_theta_obs_(use_theta_obs)
+-        {
+-            P_.fill(0.0);
+-            for(int i = 0;i < N;++i)
+-            P_[i*N+i] = 1e6;
+-        }
+-        void Ekf9::setStateFromVector(const double* x)
+-        {
+-            state_.cx = x[CX];
+-            state_.vx = x[VX];
+-            state_.cy = x[CY];
+-            state_.vy = x[VY];
+-            state_.za = x[ZA];
+-            state_.vz = x[VZ];
+-            state_.theta = x[TH];
+-            state_.omega = x[OM];
+-            state_.r = x[R];            
+-            
+-        }
+-        void Ekf9::getStateVector(double* x)const
+-        {
+-            x[CX] = state_.cx;
+-            x[VX] = state_.vx;
+-            x[CY] = state_.cy;
+-            x[VY] = state_.vy;
+-            x[ZA] = state_.za;
+-            x[VZ] = state_.vz;
+-            x[TH] = state_.theta;
+-            x[OM] = state_.omega;
+-            x[R] = state_.r;
+-            
+-        }
+-        void Ekf9::initFromMeasurement(const Vec3& p_w, double theta_meas, int plate_idx,
+-                               double t, const double* variance)
+-{
+-    const double rj = geo_.radius + geo_.radius_offset[plate_idx];
+-    const double phi = deg2rad(geo_.phase_deg[plate_idx]);
+-    const double ca = std::cos(theta_meas), sa = std::sin(theta_meas);
+-
+-    //  车心 = 板中心 + r_j * [cos(theta), sin(theta)]
+-    state_.cx = p_w.x + rj * ca;
+-    state_.cy = p_w.y + rj * sa;
+-    state_.za = p_w.z - geo_.dh[plate_idx];
+-    state_.vx = 0.0;
+-    state_.vy = 0.0;
+-    state_.vz = 0.0;
+-    state_.omega = 0.0;
+-    state_.r = geo_.radius;
+-    //  量测 theta 是"这块板"的方位角,整车 theta 要减掉它自己的相位
+-    state_.theta = wrapAngle(theta_meas - phi);
+-
+-    //  初始协方差不能只写对角线。由一帧量测初始化时,cx/cy 与 theta 是相关的:
+-    //      cx = px + r*cos(theta),  cy = py + r*sin(theta)
+-    //  只留对角线会丢掉这份相关性,后面 theta 的修正无法正确传到车心。
+-    const double sig_px = variance ? std::sqrt(variance[0]) : 0.01;
+-    const double sig_py = variance ? std::sqrt(variance[1]) : 0.01;
+-    const double sig_theta = variance && use_theta_obs_ ? std::sqrt(variance[3]) : (use_theta_obs_ ? 0.05 : 0.30);
+-    const double sig_r = 0.05;                       //  半径先验 5 cm
+-    P_.fill(0.0);
+-
+-    const double st2 = sig_theta * sig_theta;
+-    const double sr2 = sig_r * sig_r;
+-    const double spx2 = sig_px * sig_px;
+-    const double spy2 = sig_py * sig_py;
+-
+-    P_[CX * N + CX] = spx2 + rj * rj * sa * sa * st2 + ca * ca * sr2;
+-    P_[CY * N + CY] = spy2 + rj * rj * ca * ca * st2 + sa * sa * sr2;
+-    P_[CX * N + CY] = P_[CY * N + CX] =
+-        -rj * rj * sa * ca * st2 + ca * sa * sr2;
+-
+-    P_[CX * N + TH] = P_[TH * N + CX] = -rj * sa * st2;
+-    P_[CY * N + TH] = P_[TH * N + CY] = rj * ca * st2;
+-
+-    P_[CX * N + R] = P_[R * N + CX] = ca * sr2;
+-    P_[CY * N + R] = P_[R * N + CY] = sa * sr2;
+-
+-    P_[VX * N + VX] = 1.0;
+-    P_[VY * N + VY] = 1.0;
+-    P_[ZA * N + ZA] = variance ? variance[2] : 0.01 * 0.01;
+-    P_[VZ * N + VZ] = 0.25;
+-    P_[TH * N + TH] = st2;
+-    P_[OM * N + OM] = 1.0;
+-    P_[R * N + R] = sr2;
+-
+-    t_ = t;
++#include "small_matrix.hpp"
++#include <algorithm>
++#include <cmath>
++#include <limits>
++#include <stdexcept>
++namespace rmv {
++VehicleEkf::VehicleEkf(const PlateGeometry& g,bool a):geo_(g),use_theta_obs_(a) {
++    for(int i=0;i<N;++i) P_[i*N+i]=1e6;
+ }
+-
+-void Ekf9::predict(double dt, double sigma_a, double sigma_alpha, double sigma_v)
+-{
+-    if (dt < 1e-4) dt = 1e-4;
+-
+-    double x[N];
+-    getStateVector(x);
+-
+-    //  ---- 状态传播 ----
+-    x[CX] += x[VX] * dt;
+-    x[CY] += x[VY] * dt;
+-    x[ZA] += x[VZ] * dt;
+-    x[TH] = wrapAngle(x[TH] + x[OM] * dt);
+-
+-    //  ---- 协方差传播:P = F P F^T + Q ----
+-    double F[N * N] = {0.0};
+-    for (int i = 0; i < N; ++i) F[i * N + i] = 1.0;
+-    F[CX * N + VX] = dt;
+-    F[CY * N + VY] = dt;
+-    F[ZA * N + VZ] = dt;
+-    F[TH * N + OM] = dt;
+-
+-    double FP[N * N], P2[N * N], Ft[N * N];
+-    matMul(F, N, N, P_.data(), N, FP);
+-    matT(F, N, N, Ft);
+-    matMul(FP, N, N, Ft, N, P2);
+-
+-    //  Q = G * diag(q) * G^T,G 是"加速度 -> 状态"的映射
+-    double G[N * 4] = {0.0};
+-    G[CX * 4 + 0] = dt * dt / 2.0;
+-    G[VX * 4 + 0] = dt;
+-    G[CY * 4 + 1] = dt * dt / 2.0;
+-    G[VY * 4 + 1] = dt;
+-    G[ZA * 4 + 2] = dt * dt / 2.0;
+-    G[VZ * 4 + 2] = dt;
+-    G[TH * 4 + 3] = dt * dt / 2.0;
+-    G[OM * 4 + 3] = dt;
+-
+-    const double q[4] = {sigma_a * sigma_a, sigma_a * sigma_a,
+-                         sigma_v * sigma_v, sigma_alpha * sigma_alpha};
+-    for (int i = 0; i < N; ++i)
+-        for (int j = 0; j < N; ++j)
+-        {
+-            double s = 0.0;
+-            for (int k = 0; k < 4; ++k) s += G[i * 4 + k] * q[k] * G[j * 4 + k];
+-            P_[i * N + j] = P2[i * N + j] + s;
+-        }
+-
+-    //  r 是机械尺寸,基本不漂,只留极小噪声
+-    P_[R * N + R] += 1e-8;
+-
+-    x[R] = std::min(std::max(x[R], 0.12), 0.40);
+-    setStateFromVector(x);
+-    t_ += dt;
++void VehicleEkf::getStateVector(double* x) const {
++    const double a[N]={state_.cx,state_.vx,state_.cy,state_.vy,state_.za,state_.vz,
++        state_.theta,state_.omega,state_.r,state_.dr,state_.dh}; std::copy(a,a+N,x);
+ }
+-
+-void Ekf9::observe(int plate_idx, double* h, double* H, int& dim) const
+-{
+-    const double rj = state_.r + geo_.radius_offset[plate_idx];
+-    const double phi = deg2rad(geo_.phase_deg[plate_idx]);
+-    const double a = state_.theta + phi;
+-    const double ca = std::cos(a), sa = std::sin(a);
+-
+-    h[0] = state_.cx - rj * ca;
+-    h[1] = state_.cy - rj * sa;
+-    h[2] = state_.za + geo_.dh[plate_idx];
+-
+-    for (int i = 0; i < 4 * N; ++i) H[i] = 0.0;
+-    H[CX] = 1.0;
+-    H[TH] = rj * sa;
+-    H[R] = -ca;
+-
+-    H[N + CY] = 1.0;
+-    H[N + TH] = -rj * ca;
+-    H[N + R] = -sa;
+-
+-    H[2 * N + ZA] = 1.0;
+-
+-    dim = 3;
+-    if (use_theta_obs_)
+-    {
+-        h[3] = wrapAngle(a);
+-        double* row = H + 3 * N;
+-        for (int i = 0; i < N; ++i) row[i] = 0.0;
+-        row[TH] = 1.0;
+-        dim = 4;
++void VehicleEkf::setStateFromVector(const double* x) {
++    state_={x[CX],x[VX],x[CY],x[VY],x[ZA],x[VZ],x[TH],x[OM],x[R],x[DR],x[DH]};
++}
++bool VehicleEkf::validGeometry(const double* x) const {
++    for(int k=0;k<N;++k) if(!std::isfinite(x[k])) return false;
++    if(std::abs(x[DH])>.20) return false;
++    for(int j=0;j<4;++j) {
++        double r=x[R]+geo_.radius_offset[j]+(j%2?x[DR]:0.);
++        if(r<geo_.radius_min || r>geo_.radius_max) return false;
+     }
+-}
+-
+-bool Ekf9::update(int plate_idx, const double* z, int dim, const double* variance)
+-{
+-    const int dim_h = obsDim();
+-    if (dim != dim_h)
+-        return false;
+-
+-    double h[4] = {0.0};
+-    double H[4 * N] = {0.0};
+-    int d = 0;
+-    observe(plate_idx, h, H, d);
+-
+-    //  ---- 新息;角度残差要折到 (-pi, pi] ----
+-    double y[4];
+-    for (int i = 0; i < d; ++i) y[i] = z[i] - h[i];
+-    if (use_theta_obs_) y[3] = wrapAngle(y[3]);
+-
+-    //  ---- 量测噪声: 按 d x d 紧凑存放 ----
+-    //  matMul 只认连续的行主序块; 若按 4x4 存却按步长 d 取, d=3 会读到错位元素
+-    double Rm[16] = {0.0};
+-    const double Rv[4] = {0.03 * 0.03, 0.03 * 0.03, 0.10 * 0.10,
+-                          deg2rad(3.0) * deg2rad(3.0)};
+-    for (int i = 0; i < d; ++i) Rm[i * d + i] = variance ? variance[i] : Rv[i];
+-
+-    //  ---- S = H P H^T + R ----
+-    double Ht[N * 4] = {0.0}, PHt[N * 4] = {0.0}, S[16] = {0.0};
+-    matT(H, d, N, Ht);
+-    matMul(P_.data(), N, N, Ht, d, PHt);       //  P H^T
+-    matMul(H, d, N, PHt, d, S);
+-
+-    for (int i = 0; i < d; ++i)
+-        for (int j = 0; j < d; ++j) S[i * d + j] += Rm[i * d + j];
+-
+-    double Sinv[16];
+-    if (!matInv(S, d, Sinv))
+-        return false;
+-
+-    //  ---- 卡方门限挡野值 ----
+-    double d2 = 0.0;
+-    for (int i = 0; i < d; ++i)
+-        for (int j = 0; j < d; ++j) d2 += y[i] * Sinv[i * d + j] * y[j];
+-    const double gate = use_theta_obs_ ? kChi2Gate4 : kChi2Gate3;
+-    if (d2 > gate)
+-        return false;
+-
+-    //  ---- K = P H^T S^-1, x += K y ----
+-    double K[N * 4];
+-    matMul(PHt, N, d, Sinv, d, K);
+-
+-    double x[N];
+-    getStateVector(x);
+-    for (int i = 0; i < N; ++i)
+-    {
+-        double s = 0.0;
+-        for (int k = 0; k < d; ++k) s += K[i * d + k] * y[k];
+-        x[i] += s;
+-    }
+-
+-    //  ---- Joseph 形式:P = (I-KH)P(I-KH)^T + K R K^T,保证正定 ----
+-    double KH[N * N];
+-    matMul(K, N, d, H, N, KH);
+-    double IKH[N * N];
+-    for (int i = 0; i < N; ++i)
+-        for (int j = 0; j < N; ++j) IKH[i * N + j] = (i == j ? 1.0 : 0.0) - KH[i * N + j];
+-
+-    double A[N * N], B[N * N], IKt[N * N];
+-    matMul(IKH, N, N, P_.data(), N, A);
+-    matT(IKH, N, N, IKt);
+-    matMul(A, N, N, IKt, N, B);
+-
+-    double KRK[N * N];
+-    double KR[N * 4], Kt[4 * N];
+-    matMul(K, N, d, Rm, d, KR);                 //  K*R  (N x d)
+-    matT(K, N, d, Kt);                          //  K^T  (d x N)
+-    matMul(KR, N, d, Kt, N, KRK);               //  K*R*K^T
+-
+-    for (int i = 0; i < N * N; ++i) P_[i] = B[i] + KRK[i];
+-
+-    x[TH] = wrapAngle(x[TH]);
+-    x[R] = std::min(std::max(x[R], 0.12), 0.40);
+-    setStateFromVector(x);
+     return true;
+ }
+-
+-double Ekf9::mahalanobis(int plate_idx, const double* z, int dim, const double* variance) const
+-{
+-    const int d = obsDim();
+-    if (dim != d) return 1e9;
+-
+-    double h[4] = {0.0};
+-    double H[4 * N] = {0.0};
+-    int dd = 0;
+-    observe(plate_idx, h, H, dd);
+-
+-    double y[4];
+-    for (int i = 0; i < d; ++i) y[i] = z[i] - h[i];
+-    if (use_theta_obs_) y[3] = wrapAngle(y[3]);
+-
+-    //  量测噪声按 d x d 紧凑存放: 后面的 matMul 只认连续的行主序块,
+-    //  若这里按 4x4 存、却按步长 d 取, d=3 时会读到错位的元素
+-    double Rm[16] = {0.0};
+-    const double Rv[4] = {0.03 * 0.03, 0.03 * 0.03, 0.10 * 0.10,
+-                          deg2rad(3.0) * deg2rad(3.0)};
+-    for (int i = 0; i < d; ++i) Rm[i * d + i] = variance ? variance[i] : Rv[i];
+-
+-    double Ht[N * 4] = {0.0}, PHt[N * 4] = {0.0}, S[16] = {0.0};
+-    matT(H, d, N, Ht);
+-    matMul(P_.data(), N, N, Ht, d, PHt);
+-    matMul(H, d, N, PHt, d, S);
+-    for (int i = 0; i < d; ++i)
+-        for (int j = 0; j < d; ++j) S[i * d + j] += Rm[i * d + j];
+-
+-    double Sinv[16];
+-    if (!matInv(S, d, Sinv)) return 1e9;
+-
+-    double d2 = 0.0;
+-    for (int i = 0; i < d; ++i)
+-        for (int j = 0; j < d; ++j) d2 += y[i] * Sinv[i * d + j] * y[j];
+-    return d2;
++void VehicleEkf::initFromMeasurement(const Vec3& p,double angle,int plate,double,const double* covariance) {
++    if(plate<0 || plate>3 || !std::isfinite(angle) || !std::isfinite(p.x) ||
++       !std::isfinite(p.y) || !std::isfinite(p.z)) throw std::invalid_argument("Invalid EKF initial measurement");
++    auto c=Measurement().covariance;
++    if(covariance) std::copy(covariance,covariance+16,c.begin());
++    double check[16];
++    if(!small::inverseSpd(c.data(),4,check)) throw std::invalid_argument("Invalid measurement covariance");
++    const double ca=std::cos(angle),sa=std::sin(angle),r=geo_.radius+geo_.radius_offset[plate];
++    state_={p.x+r*ca,0,p.y+r*sa,0,p.z-geo_.dh[plate],0,
++        wrapAngle(angle-deg2rad(geo_.phase_deg[plate])),0,geo_.radius,0,0};
++    // Full propagation of centre = plate + r * normal, including position/yaw correlation.
++    constexpr int M=7; // [px,py,pz,yaw,r,dr,dh]
++    double b[N*M]={},v[M*M]={};
++    for(int i=0;i<4;++i) for(int j=0;j<4;++j) v[i*M+j]=c[i*4+j];
++    if(!use_theta_obs_) { for(int k=0;k<4;++k) v[3*M+k]=v[k*M+3]=0; v[3*M+3]=.3*.3; }
++    v[4*M+4]=.05*.05;
++    v[5*M+5]=v[6*M+6]=geo_.estimate_pair_geometry?.04*.04:1e-12;
++    b[CX*M]=1;b[CX*M+3]=-r*sa;b[CX*M+4]=ca;b[CX*M+5]=(plate%2)*ca;
++    b[CY*M+1]=1;b[CY*M+3]=r*ca;b[CY*M+4]=sa;b[CY*M+5]=(plate%2)*sa;
++    b[ZA*M+2]=1;b[ZA*M+6]=-(plate%2);b[TH*M+3]=1;
++    b[R*M+4]=1;b[DR*M+5]=1;b[DH*M+6]=1;
++    P_.fill(0);
++    for(int i=0;i<N;++i) for(int j=0;j<N;++j) for(int k=0;k<M;++k) for(int l=0;l<M;++l)
++        P_[i*N+j]+=b[i*M+k]*v[k*M+l]*b[j*M+l];
++    P_[VX*N+VX]=P_[VY*N+VY]=1;P_[VZ*N+VZ]=.25;P_[OM*N+OM]=1;
++    last_nis_=0;last_dof_=0;
+ }
+-}   //  namespace rmv
+-
+-    
++void VehicleEkf::predict(double dt,double sigma_a,double sigma_alpha,double sigma_z) {
++    if(!std::isfinite(dt) || dt<=0) throw std::invalid_argument("Prediction dt must be positive");
++    double x[N];getStateVector(x);
++    double f[N*N]={};for(int i=0;i<N;++i) f[i*N+i]=1;
++    for(int k:{CX,CY,ZA,TH}) { x[k]+=x[k+1]*dt;f[k*N+k+1]=dt; }
++    x[TH]=wrapAngle(x[TH]);
++    std::array<double,N*N> next{};
++    for(int i=0;i<N;++i) for(int j=0;j<N;++j) for(int k=0;k<N;++k) for(int l=0;l<N;++l)
++        next[i*N+j]+=f[i*N+k]*P_[k*N+l]*f[j*N+l];
++    const double q[4]={sigma_a*sigma_a,sigma_a*sigma_a,sigma_z*sigma_z,sigma_alpha*sigma_alpha};
++    for(int a=0;a<4;++a) {
++        int k=2*a;next[k*N+k]+=.25*dt*dt*dt*dt*q[a];
++        next[k*N+k+1]+=.5*dt*dt*dt*q[a];next[(k+1)*N+k]+=.5*dt*dt*dt*q[a];
++        next[(k+1)*N+k+1]+=dt*dt*q[a];
++    }
++    next[R*N+R]+=2.4e-7*dt;
++    if(geo_.estimate_pair_geometry) { next[DR*N+DR]+=1e-8*dt;next[DH*N+DH]+=1e-8*dt; }
++    P_=next;setStateFromVector(x);
++}
++void VehicleEkf::observe(int plate,double* h,double* H,int& dim) const {
++    const double odd=plate%2,a=state_.theta+deg2rad(geo_.phase_deg[plate]);
++    const double r=state_.r+geo_.radius_offset[plate]+odd*state_.dr,ca=std::cos(a),sa=std::sin(a);
++    h[0]=state_.cx-r*ca;h[1]=state_.cy-r*sa;h[2]=state_.za+geo_.dh[plate]+odd*state_.dh;
++    std::fill(H,H+4*N,0.);
++    H[CX]=1;H[TH]=r*sa;H[R]=-ca;H[DR]=-odd*ca;
++    H[N+CY]=1;H[N+TH]=-r*ca;H[N+R]=-sa;H[N+DR]=-odd*sa;
++    H[2*N+ZA]=1;H[2*N+DH]=odd;
++    dim=obsDim();if(use_theta_obs_) { h[3]=wrapAngle(a);H[3*N+TH]=1; }
++}
++bool VehicleEkf::innovation(const std::vector<PlateObservation>& obs,double* y,double* H,
++                            double* noise,double* inverseS,int& dim) const {
++    const int d=obsDim();dim=d*static_cast<int>(obs.size());
++    if(obs.empty() || obs.size()>4) return false;
++    std::fill(noise,noise+dim*dim,0.);
++    for(int b=0;b<(int)obs.size();++b) {
++        if(obs[b].plate<0 || obs[b].plate>3) return false;
++        const auto& m=obs[b].measurement;double h[4],hb[4*N],check[16];int hd;
++        if(!small::inverseSpd(m.covariance.data(),4,check)) return false;
++        observe(obs[b].plate,h,hb,hd);
++        const double z[4]={m.p_w.x,m.p_w.y,m.p_w.z,m.theta};
++        for(int i=0;i<d;++i) {
++            y[b*d+i]=i==3?wrapAngle(z[i]-h[i]):z[i]-h[i];
++            if(!std::isfinite(y[b*d+i])) return false;
++            std::copy(hb+i*N,hb+(i+1)*N,H+(b*d+i)*N);
++            for(int j=0;j<d;++j) noise[(b*d+i)*dim+b*d+j]=m.covariance[i*4+j];
++        }
++    }
++    // Off-diagonal blocks retain shared IMU attitude noise between simultaneous plates.
++    for(int a=0;a<(int)obs.size();++a) for(int b=0;b<(int)obs.size();++b)
++        for(int i=0;i<d;++i) for(int j=0;j<d;++j) for(int k=0;k<3;++k)
++            noise[(a*d+i)*dim+b*d+j]+=obs[a].measurement.shared_noise[i*3+k]*obs[b].measurement.shared_noise[j*3+k];
++    double s[256]={};
++    for(int i=0;i<dim;++i) for(int j=0;j<dim;++j) {
++        s[i*dim+j]=noise[i*dim+j];
++        for(int k=0;k<N;++k) for(int l=0;l<N;++l) s[i*dim+j]+=H[i*N+k]*P_[k*N+l]*H[j*N+l];
++    }
++    return small::inverseSpd(s,dim,inverseS);
++}
++double VehicleEkf::mahalanobis(int plate,const double* z,int dim,const double* covariance) const {
++    if(dim!=obsDim()) return std::numeric_limits<double>::infinity();
++    Measurement m;m.p_w={z[0],z[1],z[2]};if(dim==4) m.theta=z[3];
++    if(covariance) std::copy(covariance,covariance+16,m.covariance.begin());
++    double y[16],h[16*N],r[256],si[256];int d;
++    if(!innovation({{plate,m}},y,h,r,si,d)) return std::numeric_limits<double>::infinity();
++    double value=0;for(int i=0;i<d;++i) for(int j=0;j<d;++j) value+=y[i]*si[i*d+j]*y[j];
++    return value;
++}
++bool VehicleEkf::update(int plate,const double* z,int dim,const double* covariance) {
++    if(dim!=obsDim()) return false;
++    Measurement m;m.p_w={z[0],z[1],z[2]};if(dim==4) m.theta=z[3];
++    if(covariance) std::copy(covariance,covariance+16,m.covariance.begin());
++    return updateBatch({{plate,m}});
++}
++bool VehicleEkf::updateBatch(const std::vector<PlateObservation>& obs) {
++    double y[16],H[16*N],noise[256],si[256];int d;
++    last_nis_=std::numeric_limits<double>::quiet_NaN();last_dof_=0;
++    if(!innovation(obs,y,H,noise,si,d)) return false;
++    last_nis_=0;last_dof_=d;
++    for(int i=0;i<d;++i) for(int j=0;j<d;++j) last_nis_+=y[i]*si[i*d+j]*y[j];
++    if(!std::isfinite(last_nis_) || last_nis_>small::chiSquareGate(d)) return false;
++    double pht[N*16]={},gain[N*16]={},x[N];getStateVector(x);
++    for(int i=0;i<N;++i) for(int j=0;j<d;++j) for(int k=0;k<N;++k)
++        pht[i*d+j]+=P_[i*N+k]*H[j*N+k];
++    for(int i=0;i<N;++i) for(int j=0;j<d;++j) for(int k=0;k<d;++k)
++        gain[i*d+j]+=pht[i*d+k]*si[k*d+j];
++    for(int i=0;i<N;++i) for(int j=0;j<d;++j) x[i]+=gain[i*d+j]*y[j];
++    x[TH]=wrapAngle(x[TH]);if(!validGeometry(x)) return false;
++    double a[N*N]={},ap[N*N]={};std::array<double,N*N> next{};
++    for(int i=0;i<N;++i) for(int j=0;j<N;++j) {
++        a[i*N+j]=(i==j?1.:0.);for(int k=0;k<d;++k) a[i*N+j]-=gain[i*d+k]*H[k*N+j];
++    }
++    for(int i=0;i<N;++i) for(int j=0;j<N;++j) for(int k=0;k<N;++k)
++        ap[i*N+j]+=a[i*N+k]*P_[k*N+j];
++    // Joseph update; keep full cross terms and commit state/covariance together.
++    for(int i=0;i<N;++i) for(int j=0;j<N;++j) {
++        for(int k=0;k<N;++k) next[i*N+j]+=ap[i*N+k]*a[j*N+k];
++        for(int k=0;k<d;++k) for(int l=0;l<d;++l) next[i*N+j]+=gain[i*d+k]*noise[k*d+l]*gain[j*d+l];
++    }
++    for(int i=0;i<N;++i) for(int j=0;j<i;++j)
++        next[i*N+j]=next[j*N+i]=.5*(next[i*N+j]+next[j*N+i]);
++    double check[N*N];if(!small::inverseSpd(next.data(),N,check)) return false;
++    P_=next;setStateFromVector(x);return true;
++}
++bool VehicleEkf::covarianceHealthy() const {
++    double inverse[N*N];return small::inverseSpd(P_.data(),N,inverse);
++}
++}
+--- a/src/frame_timeline.cpp
++++ b/src/frame_timeline.cpp
+@@ -0,0 +1,23 @@
++#include "frame_timeline.hpp"
++#include <fstream>
++#include <sstream>
++#include <stdexcept>
++#include <cmath>
++namespace rmv {
++std::vector<double> loadFrameTimes(const std::string& path) {
++    std::ifstream in(path);if(!in) throw std::runtime_error("Cannot open frame timestamps: "+path);
++    std::string line;std::vector<double> times;
++    if(!std::getline(in,line) || (line!="frame,t_image_s" && line!="frame,t_image_s\r"))
++        throw std::runtime_error("Frame timestamp header must be frame,t_image_s");
++    while(std::getline(in,line)) {
++        if(line.empty() || line=="\r") continue;
++        std::istringstream ss(line);int frame;double t;char comma;std::string extra;
++        if(!(ss>>frame>>comma>>t) || comma!=',' || (ss>>extra) || frame!=(int)times.size() ||
++           !std::isfinite(t) || (!times.empty() && t<=times.back()))
++            throw std::runtime_error("Invalid/nonmonotonic frame timestamp row");
++        times.push_back(t);
++    }
++    if(times.empty()) throw std::runtime_error("Empty frame timestamp file");
++    return times;
++}
++}
+--- a/src/imu_series.cpp
++++ b/src/imu_series.cpp
+@@ -1,107 +1,42 @@
+-#include"imu_series.hpp"
+-#include<algorithm>
+-#include<fstream>
+-#include<sstream>
+-using namespace std;
+-namespace rmv
+-{
+-    bool ImuSeries::load(const string& path)
+-    {
+-        samples_.clear();
+-        ifstream ifs(path);
+-        if(!ifs.is_open())
+-        {
+-            return false;
++#include "imu_series.hpp"
++#include <algorithm>
++#include <fstream>
++#include <sstream>
++#include <cmath>
++#include <iostream>
++namespace rmv {
++bool ImuSeries::load(const std::string& path) {
++    samples_.clear();std::ifstream in(path);if(!in) return false;
++    std::string line;int row=0;
++    while(std::getline(in,line)) {
++        ++row;auto start=line.find_first_not_of(" \t\r");
++        if(start==std::string::npos || line[start]=='#') continue;
++        std::istringstream ss(line);ImuSample s;std::string extra;
++        if(!(ss>>s.t>>s.q.w>>s.q.x>>s.q.y>>s.q.z) || (ss>>extra) ||
++           !std::isfinite(s.t) || !std::isfinite(s.q.norm()) || s.q.norm()<1e-6 ||
++           (!samples_.empty() && s.t<=samples_.back().t)) {
++            std::cerr<<"Invalid/nonmonotonic IMU row "<<row<<"\n";samples_.clear();return false;
+         }
+-        string line;
+-        while(getline(ifs,line))
+-        {
+-            if(line.empty()||line[0]=='#')
+-            {
+-                continue;
+-            }
+-            istringstream ss(line);
+-            ImuSample s;
+-            if(!(ss>>s.t>>s.q.w>>s.q.x>>s.q.y>>s.q.z))
+-            {
+-                continue;
+-            }
+-            samples_.push_back(s);
+-        }
+-        //按时间戳升序排序
+-        sort(samples_.begin(),samples_.end(),[](const ImuSample& a,const ImuSample& b){return a.t<b.t;});
+-        return !samples_.empty();
++        s.q=s.q.normalized();samples_.push_back(s);
+     }
+-
+-    double ImuSeries::tBegin() const {return samples_.empty()?0.0:samples_.front().t;}
+-    double ImuSeries::tEnd() const {return samples_.empty()?0.0:samples_.back().t;}
+-
+-    Quaternion ImuSeries::quatAt(double t,double offset) const
+-    {
+-        if(samples_.empty())
+-        {
+-            return Quaternion();
+-        }
+-        const double t_query=t+offset;
+-
+-        //首帧回落到第一条imu前
+-        if(t_query<=samples_.front().t)
+-        {
+-            return samples_.front().q.normalized();
+-        }
+-        if(t_query>=samples_.back().t)
+-        {
+-            return samples_.back().q.normalized();
+-        }
+-
+-        //找第一个大于t_query的样本
+-        auto it=lower_bound(samples_.begin(),samples_.end(),t_query,[](const ImuSample& s,double v){return s.t<v;});
+-
+-        if(it==samples_.begin())
+-        {
+-            return it->q.normalized();
+-        }
+-        const ImuSample& b=*it;
+-        const ImuSample& a=*(it-1);
+-        const double span=b.t-a.t;
+-
+-        if(span<=1e-9)
+-        {
+-            return a.q.normalized();
+-        }
+-        const double u=(t_query-a.t)/span;
+-        return slerp(a.q,b.q,u);
+-    }
+-    Mat3 ImuSeries::rotationAt(double t,double offset) const
+-    {
+-        return quatAt(t,offset).toMat3();
+-    }
+-    double ImuSeries::timeAt(int idx)const
+-    {
+-        if(samples_.empty())
+-        {
+-            return 0.0;
+-        }
+-        if(idx<0)
+-        {
+-            idx=0;
+-        }
+-        if(idx>=(int)samples_.size())
+-        {
+-            idx=(int)samples_.size()-1;
+-        }
+-        return samples_[(size_t)idx].t;
+-    }
+-    double ImuSeries::meanRate() const
+-    {
+-        if(samples_.size()<2)
+-        {
+-            return 30.0;
+-        }
+-        const double span=samples_.back().t-samples_.front().t;
+-        return span>1e-6?((double)(samples_.size()-1))/span:30.0;
+-    }
+-
+-
+-           
++    return samples_.size()>=2;
+ }
++double ImuSeries::tBegin() const {return samples_.empty()?0:samples_.front().t;}
++double ImuSeries::tEnd() const {return samples_.empty()?0:samples_.back().t;}
++Quaternion ImuSeries::quatAt(double t,double offset) const {
++    if(samples_.empty() || !std::isfinite(t+offset)) throw std::invalid_argument("Invalid IMU query");
++    const double query=t+offset;
++    if(query<=tBegin()) return samples_.front().q;
++    if(query>=tEnd()) return samples_.back().q;
++    auto it=std::lower_bound(samples_.begin(),samples_.end(),query,[](const auto& s,double v){return s.t<v;});
++    const auto& a=*(it-1);return slerp(a.q,it->q,(query-a.t)/(it->t-a.t));
++}
++Mat3 ImuSeries::rotationAt(double t,double offset) const {return quatAt(t,offset).toMat3();}
++double ImuSeries::timeAt(int index) const {
++    if(index<0 || index>=(int)samples_.size()) throw std::out_of_range("IMU sample index");
++    return samples_[index].t;
++}
++double ImuSeries::meanRate() const {
++    return samples_.size()<2?0:double(samples_.size()-1)/(tEnd()-tBegin());
++}
++}
+--- a/src/main_w3.cpp
++++ b/src/main_w3.cpp
+@@ -1,408 +1,203 @@
+-#include<opencv2/opencv.hpp>
+-#include<array>
+-#include<cmath>
+-#include<limits>
+-#include<cstdio>
+-#include<filesystem>
+-#include<fstream>
+-#include<iostream>
+-#include<memory>
+-#include<string>
+-#include<utility>
+-#include<vector>
+-
++#include <opencv2/opencv.hpp>
+ #include "camera.hpp"
++#include "detection_cache.hpp"
++#include "frame_timeline.hpp"
+ #include "imu_series.hpp"
+ #include "measurement.hpp"
+ #include "nn_detector.hpp"
+ #include "number_classifier.hpp"
+-#include "pnp_solver.hpp"
++#include "pose_estimator.hpp"
+ #include "state_visualizer.hpp"
+ #include "tracker.hpp"
+ #include "traditional_detector.hpp"
+-#include "types.hpp"
+ #include "visualizer.hpp"
+ #include "w3_config_loader.hpp"
+-#include "world_frame.hpp"
+-using namespace std;
++#include <filesystem>
++#include <fstream>
++#include <iomanip>
++#include <iostream>
++#include <limits>
++#include <memory>
++#include <stdexcept>
++namespace fs=std::filesystem;
+ using namespace rmv;
+-
+-namespace fs = filesystem;
+-namespace
+-{
+-    struct Args
+-    {
+-        string input = "data/test.avi";
+-        string imu = "data/imu.txt";
+-        string method = "nn";
+-        string time_mode = "imu-index";
+-        bool time_mode_explicit = false;
+-        string camera = "camera.yaml";
+-        string models = "models";
+-        string out = "results/overlay_week3.avi";
+-        string csv = "results/states_week3.csv";
+-        bool show = false;
+-        bool debug_detections = true;
+-        bool write_video = true;
+-        int max_frames = 0; 
+-        double video_start_time = numeric_limits<double>::quiet_NaN();
+-        double imu_offset = numeric_limits<double>::quiet_NaN();
+-        double plate_radius = numeric_limits<double>::quiet_NaN();
+-    };
+-    bool parseArgs(int argc,char** argv,Args& a)
+-    {
+-        for(int i = 1;i < argc;++i)
+-        {
+-            const string s = argv[i];
+-            if(s == "--imu" && i+1 < argc) a.imu = argv[++i];
+-            else if(s == "--method" && i+1 <argc) a.method = argv[++i];
+-            else if(s == "--time-mode" && i+1 < argc) { a.time_mode = argv[++i]; a.time_mode_explicit = true; }
+-            else if(s == "--camera" && i+1 <argc) a.camera = argv[++i];
+-            else if(s == "--models" && i+1 <argc) a.models = argv[++i];
+-            else if(s == "--out" && i+1 <argc) a.out = argv[++i];
+-            else if(s == "--max-frames" && i+1 <argc) a.max_frames = stoi(argv[++i]);
+-            else if(s == "--video-start-time" && i+1 < argc) a.video_start_time = stod(argv[++i]);
+-            else if(s == "--imu-offset" && i+1 < argc) a.imu_offset = stod(argv[++i]);
+-            else if(s == "--plate-radius" && i+1 < argc) a.plate_radius = stod(argv[++i]);
+-            else if(s == "--csv" && i+1 <argc) a.csv = argv[++i];
+-            else if(s == "--show") a.show = true;
+-            else if(s == "--debug-detections") a.debug_detections = true;
+-            else if(s == "--no-debug-detections") a.debug_detections = false;
+-            else if(s == "--no-video") a.write_video = false;
+-            else if(s[0]!='-') a.input = s;
+-            else
+-            {
+-                cerr << "未知参数 " << s << endl;
+-                return false;
++namespace {
++constexpr double NaN=std::numeric_limits<double>::quiet_NaN();
++struct Args {
++    std::string input="data/test.avi",imu="data/imu.txt",camera="camera.yaml",models="models",method="nn";
++    std::string mode="imu-index",frame_times,cache,out="results/overlay_week3.avi",csv="results/states_week3.csv";
++    bool mode_explicit=false,video=true,debug=false,show=false;
++    int max_frames=0;double start=NaN,offset=NaN,radius=NaN;
++};
++double number(const std::string& s) {
++    size_t used;double v=std::stod(s,&used);if(used!=s.size()||!std::isfinite(v)) throw std::runtime_error("Invalid number: "+s);return v;
++}
++Args parse(int argc,char** argv) {
++    Args a;
++    for(int i=1;i<argc;++i) {
++        std::string s=argv[i];auto value=[&]() {if(i+1>=argc) throw std::runtime_error("Missing value for "+s);return std::string(argv[++i]);};
++        if(s=="--imu") a.imu=value();else if(s=="--camera") a.camera=value();else if(s=="--models") a.models=value();
++        else if(s=="--method") a.method=value();else if(s=="--out") a.out=value();else if(s=="--csv") a.csv=value();
++        else if(s=="--time-mode") {a.mode=value();a.mode_explicit=true;}
++        else if(s=="--frame-times") a.frame_times=value();else if(s=="--detection-cache") a.cache=value();
++        else if(s=="--video-start-time") a.start=number(value());else if(s=="--imu-offset") a.offset=number(value());
++        else if(s=="--plate-radius") a.radius=number(value());
++        else if(s=="--max-frames") {double n=number(value());if(n<0||n>10000000||n!=std::floor(n)) throw std::runtime_error("Invalid frame limit");a.max_frames=int(n);}
++        else if(s=="--no-video") a.video=false;else if(s=="--show") a.show=true;
++        else if(s=="--debug-detections") a.debug=true;else if(s=="--no-debug-detections") a.debug=false;
++        else if(!s.empty()&&s[0]!='-') a.input=s;else throw std::runtime_error("Unknown argument: "+s);
++    }
++    if(!a.mode_explicit) {if(!a.frame_times.empty()) a.mode="timestamps";else if(std::isfinite(a.start)) a.mode="video";}
++    if(a.mode!="imu-index"&&a.mode!="video"&&a.mode!="timestamps") throw std::runtime_error("Invalid time mode");
++    if((a.mode=="timestamps")!=(!a.frame_times.empty())) throw std::runtime_error("timestamps mode requires --frame-times");
++    if((a.mode=="video")!=std::isfinite(a.start)) throw std::runtime_error("video mode requires --video-start-time exclusively");
++    if(a.method!="nn"&&a.method!="trad") throw std::runtime_error("method must be nn or trad");
++    return a;
++}
++void parent(const std::string& path) {if(!fs::path(path).parent_path().empty()) fs::create_directories(fs::path(path).parent_path());}
++double reprojection(const Armor& a,int j,const EkfState& s,const W3Config& cfg,const CameraParams& cam,const WorldFrame& wf,double t) {
++    auto points=plateCornersWorld(s,j,cfg.plate,(a.size==ArmorSize::BIG?cam.big_width:cam.small_width)/1000.,
++                                  (a.size==ArmorSize::BIG?cam.big_height:cam.small_height)/1000.);
++    double sum=0;
++    for(int k=0;k<4;++k) {
++        Vec3 p(points[k].x,points[k].y,points[k].z);if(wf.world_to_cam(t,p).z<=.05) return NaN;
++        auto uv=wf.project(t,p);double dx=uv.x-a.corners[k].x,dy=uv.y-a.corners[k].y;sum+=dx*dx+dy*dy;
++    }return std::sqrt(sum/4);
++}
++double allMatchedReprojection(const std::vector<Armor>& armors,const TrackerDiag& d,const EkfState& s,
++                              const W3Config& cfg,const CameraParams& cam,const WorldFrame& wf,double t) {
++    double sum=0;int n=0;
++    for(int j=0;j<4;++j) {int i=d.matched_meas_by_plate[j];if(i<0) continue;
++        double r=reprojection(armors[i],j,s,cfg,cam,wf,t);if(std::isfinite(r)){sum+=r*r;++n;}}
++    return n?std::sqrt(sum/n):NaN;
++}
++int run(const Args& a) {
++    CameraParams cam;W3Config cfg;
++    if(!loadCameraParams(a.camera,cam)||!loadW3Config(a.camera,cfg)) throw std::runtime_error("Invalid camera/configuration");
++    if(std::isfinite(a.offset)) cfg.img_imu_offset=a.offset;
++    if(a.method=="trad") {
++        cfg.corner_sigma_px=cfg.traditional_corner_sigma_px;
++        cfg.position_noise_floor_m=cfg.traditional_position_floor_m;
++        cfg.yaw_noise_floor_deg=cfg.traditional_yaw_floor_deg;
++    }
++    if(std::isfinite(a.radius)) {
++        for(double dr:cfg.plate.radius_offset) if(a.radius+dr<cfg.plate.radius_min||a.radius+dr>cfg.plate.radius_max)
++            throw std::runtime_error("--plate-radius outside configured bounds");
++        cfg.plate.radius=a.radius;
++    }
++    ImuSeries imu;if(!imu.load(a.imu)) throw std::runtime_error("Invalid IMU data");
++    auto times=a.mode=="timestamps"?loadFrameTimes(a.frame_times):std::vector<double>();
++    WorldFrame wf(&imu,&cfg);PoseEstimator poses(cam,cfg);Tracker tracker(cfg.plate,cfg.use_theta_obs!=0);
++    cv::VideoCapture cap(a.input);if(!cap.isOpened()) throw std::runtime_error("Cannot open input video");
++    const int width=int(cap.get(cv::CAP_PROP_FRAME_WIDTH)),height=int(cap.get(cv::CAP_PROP_FRAME_HEIGHT));
++    const int frames=int(std::llround(cap.get(cv::CAP_PROP_FRAME_COUNT)));const double video_fps=cap.get(cv::CAP_PROP_FPS);
++    if(width!=cam.image_width||height!=cam.image_height) throw std::runtime_error("Video/calibration resolution mismatch");
++    if(a.mode=="imu-index"&&frames>0&&frames!=(int)imu.size()) throw std::runtime_error("Index mode requires equal video/IMU counts");
++    if(a.mode=="timestamps"&&frames>0&&frames!=(int)times.size()) throw std::runtime_error("Frame timestamp count mismatch");
++    if(a.mode=="video"&&(!std::isfinite(video_fps)||video_fps<=0)) throw std::runtime_error("Invalid video FPS");
++    double fps=a.mode=="video"?video_fps:(a.mode=="timestamps"?double(times.size()-1)/(times.back()-times.front()):imu.meanRate());
++    if(!std::isfinite(fps)||fps<=0) throw std::runtime_error("Invalid output FPS");
++    if(a.mode=="imu-index") std::cerr<<"ASSUMPTION: image i uses IMU row i as its image timestamp; recording correspondence is UNVERIFIED.\n";
++    if(a.mode=="video") std::cerr<<"ASSUMPTION: container times are capture times; verify separately for this recording.\n";
++    std::cout<<"Input "<<width<<'x'<<height<<", frames="<<frames<<", IMU="<<imu.size()<<", output_fps="<<fps
++             <<", offset="<<cfg.img_imu_offset<<", state_dim="<<VehicleEkf::N<<"\n";
++    const std::string model=a.models+(a.method=="nn"?"/Infantry-v8n.onnx":"/mlp.onnx");
++    const std::string signature="rm_week3_detections_v1 "+fileFingerprint(a.input)+" "+fileFingerprint(model)+" "+a.method+" "+enemyColorName(cam.enemy_color);
++    std::vector<std::vector<Armor>> cached;bool use_cache=!a.cache.empty()&&fs::exists(a.cache);
++    if(use_cache) {cached=readDetectionCache(a.cache,signature);if(frames>0&&frames!=(int)cached.size()) throw std::runtime_error("Incomplete detection cache");}
++    std::unique_ptr<NumberClassifier> classifier;std::unique_ptr<TraditionalDetector> traditional;std::unique_ptr<NnDetector> nn;
++    if(!use_cache) {
++        if(a.method=="nn") nn=std::make_unique<NnDetector>(model,cam.enemy_color);
++        else {classifier=std::make_unique<NumberClassifier>(model);traditional=std::make_unique<TraditionalDetector>(cam,*classifier);}
++    }
++    parent(a.csv);if(a.video) parent(a.out);
++    cv::VideoWriter writer;if(a.video) {
++        writer.open(a.out,cv::VideoWriter::fourcc('M','J','P','G'),fps,{width,height});
++        if(!writer.isOpened()) throw std::runtime_error("Cannot create output video");
++    }
++    std::ofstream csv(a.csv);if(!csv) throw std::runtime_error("Cannot create output CSV");csv<<std::setprecision(10);
++    csv<<"frame,t,cx,vx,cy,vy,za,vz,theta,omega,r,dr,dh,matched_j,n_detected,n_meas,n_matched,initialization,reinit,imu_clamped,pre_reproj_rms_px,pre_z_residual_m,pre_reproj_all_rms_px,post_reproj_all_rms_px,nis,nis_dof,covariance_ok";
++    for(int k=0;k<VehicleEkf::N;++k) csv<<",P"<<k;
++    csv<<'\n';
++    std::array<bool,4> big{};cv::Mat frame;int fid=0,matched_frames=0,rejected=0,clamped=0;bool stopped=false;
++    double previous=-std::numeric_limits<double>::infinity();
++    while((a.max_frames==0||fid<a.max_frames)&&cap.read(frame)) {
++        double t;
++        if(a.mode=="imu-index") t=imu.timeAt(fid);
++        else if(a.mode=="timestamps") {if(fid>=(int)times.size()) throw std::runtime_error("Missing frame timestamp");t=times[fid];}
++        else {double ms=cap.get(cv::CAP_PROP_POS_MSEC);double relative=(std::isfinite(ms)&&ms>=0&&(fid==0||ms>0))?ms/1000.:fid/video_fps;t=a.start+relative;}
++        if(t<=previous) throw std::runtime_error("Nonmonotonic image timestamps");
++        previous=t;
++        double query=t+cfg.img_imu_offset;bool boundary=query<imu.tBegin()-1e-9||query>imu.tEnd()+1e-9;
++        // The legacy index assumption has no earlier attitude for its first frame only.
++        if(boundary && !(a.mode=="imu-index"&&fid==0&&query<imu.tBegin()&&imu.tBegin()-query<=.02))
++            throw std::runtime_error("Frame outside IMU coverage: "+std::to_string(fid));
++        if(boundary) ++clamped;
++        std::vector<Armor> armors;
++        if(use_cache) {if(fid>=(int)cached.size()) throw std::runtime_error("Missing cached frame");armors=cached[fid];}
++        else {armors=nn?nn->detect(frame):traditional->detect(frame);if(!a.cache.empty()) cached.push_back(armors);}
++        std::vector<Measurement> measurements;std::vector<Armor> accepted;std::vector<std::pair<Armor,PoseResult>> debug;
++        for(const auto& armor:armors) {
++            auto result=poses.estimate(armor,t,wf);if(a.debug) debug.push_back({armor,result.pose});
++            if(!result.ok) {++rejected;continue;}measurements.push_back(result.measurement);accepted.push_back(armor);
++        }
++        TrackerDiag diag;const auto* state=tracker.step(t,measurements,&diag);
++        double pre=NaN,zres=NaN,pre_all=NaN,post_all=NaN;
++        if(diag.has_prediction && !diag.initialization && diag.matched_j>=0) {
++            pre=reprojection(accepted[diag.matched_meas],diag.matched_j,diag.predicted,cfg,cam,wf,t);
++            zres=measurements[diag.matched_meas].p_w.z-plateWorldPosition(diag.predicted,diag.matched_j,cfg.plate).z;
++            pre_all=allMatchedReprojection(accepted,diag,diag.predicted,cfg,cam,wf,t);
++        }
++        if(state) {
++            if(diag.initialization) big.fill(false);
++            for(int j=0;j<4;++j) if(diag.matched_meas_by_plate[j]>=0) big[j]=measurements[diag.matched_meas_by_plate[j]].is_big;
++            post_all=allMatchedReprojection(accepted,diag,*state,cfg,cam,wf,t);
++            if(a.video) {
++                if(a.debug) Visualizer::drawResults(frame,debug);
++                drawPlates(frame,wf,t,*state,cfg.plate,big,cam.small_width/1000.,cam.small_height/1000.,cam.big_width/1000.,cam.big_height/1000.,diag.matched_j);
++                drawStateText(frame,*state,fid,diag.matched_j,diag.n_meas);
++                if(a.mode=="imu-index") cv::putText(frame,"time: index assumption",{20,height-20},cv::FONT_HERSHEY_SIMPLEX,.5,{0,220,255},1,cv::LINE_AA);
+             }
+         }
+-        if(!a.time_mode_explicit && isfinite(a.video_start_time)) a.time_mode = "video";
+-        if(a.time_mode != "imu-index" && a.time_mode != "video")
+-        {
+-            cerr << "--time-mode 应为 imu-index 或 video\n";
+-            return false;
+-        }
+-        if(a.time_mode == "video" && !isfinite(a.video_start_time))
+-        {
+-            cerr << "video 时间模式需要 --video-start-time 指定首帧图像时间\n";
+-            return false;
+-        }
+-        if(a.time_mode == "imu-index" && isfinite(a.video_start_time))
+-        {
+-            cerr << "imu-index 时间模式不能同时指定 --video-start-time\n";
+-            return false;
+-        }
+-        if(isfinite(a.plate_radius) && (a.plate_radius < 0.05 || a.plate_radius > 0.6))
+-        {
+-            cerr << "--plate-radius 应在 0.05 到 0.6 米之间\n";
+-            return false;
+-        }
+-        return true;
+-    }
+-    //cv::Mat的3*3->我们的Mat3
+-    Vec3 matCol(const cv::Mat& R,int col)
+-    {
+-        return Vec3(R.at<double>(0,col),R.at<double>(1,col),R.at<double>(2,col));
+-    }
+-
+-    constexpr double kMaxTrustRmsPx = 4.0;
+-    constexpr double kMinTrustDistMm = 200.0;
+-    constexpr double kMaxTrustDistMm = 15000.0;
+-
+-    bool poseTrustworthy(const PoseResult& p)
+-    {
+-        if(!p.ok)
+-        {
+-            return false;
+-        }
+-        if(p.rms_px > kMaxTrustRmsPx)
+-        {
+-            return false;
+-        }
+-        const double d = cv::norm(p.tvec);
+-        return d >= kMinTrustDistMm && d <= kMaxTrustDistMm;
+-    }
+-    array<double,4> measurementVariance(const PoseResult& pose,const Armor& armor,
+-                                         const CameraParams& cam,const Mat3& R_cw)
+-    {
+-        const double z = pose.tvec.at<double>(2) / 1000.0;
+-        const double fx = cam.camera_matrix.at<double>(0,0);
+-        const double fy = cam.camera_matrix.at<double>(1,1);
+-        const double width = (armor.size == ArmorSize::BIG ? cam.big_width : cam.small_width) / 1000.0;
+-        const double px = max(0.5,pose.rms_px);
+-        // 像素误差通过针孔模型近似传播；深度与朝向在远距离时更不确定。
+-        const double sx = max(0.01,2.0*px*z/fx);
+-        const double sy = max(0.01,2.0*px*z/fy);
+-        const double sz = max(0.03,2.0*px*z*z/(fx*width));
+-        const double sa = max(deg2rad(5.0),2.0*px*z/(fx*width));
+-        const double vc[3] = {sx*sx,sy*sy,sz*sz};
+-        array<double,4> out{};
+-        for(int i=0;i<3;++i)
+-            for(int j=0;j<3;++j) out[i] += R_cw.m[i][j]*R_cw.m[i][j]*vc[j];
+-        out[3] = sa*sa;
+-        return out;
+-    }
+-}   //namespace
+-
+-int main(int argc,char** argv)
+-{
+-    Args args;
+-    if(!parseArgs(argc,argv,args))
+-    {
+-        return 1;
+-    }
+-    CameraParams cam;
+-    if(!loadCameraParams(args.camera,cam))
+-    {
+-        cerr << "读取相机参数失败:" <<args.camera <<endl;
+-        return 1;
+-    }
+-    W3Config cfg;
+-    if(!loadW3Config(args.camera,cfg))
+-    {
+-        cerr << "读取第三周配置失败:" <<args.camera << endl;
+-        return 1;
+-    }
+-    if(isfinite(args.imu_offset)) cfg.img_imu_offset = args.imu_offset;
+-    if(isfinite(args.plate_radius)) cfg.plate.radius = args.plate_radius;
+-    printf("IMU 查询偏移 %.6f s,板半径初值 %.3f m\n",cfg.img_imu_offset,cfg.plate.radius);
+-    cfg.imu_path = args.imu;
+-
+-    ImuSeries imu;
+-    if(!imu.load(args.imu))
+-    {
+-        cerr << "读取IMU失败:" << args.imu << endl;
+-        return 1;
+-    }
+-    printf("IMU:%zu条,%.6f~%.6f s,平均%.3f Hz\n",imu.size(),imu.tBegin(),imu.tEnd(),imu.meanRate());
+-    WorldFrame wf(&imu,&cfg);
+-    PnpSolver solver(cam);
+-
+-    unique_ptr<NumberClassifier> clf;
+-    unique_ptr<TraditionalDetector> trad;
+-    unique_ptr<NnDetector> nn;
+-
+-    if(args.method == "trad")
+-    {
+-        clf = make_unique<NumberClassifier>(args.models + "/mlp.onnx");
+-        trad = make_unique<TraditionalDetector>(cam,*clf);
+-    }
+-    else if(args.method == "nn")
+-    {
+-        nn = make_unique<NnDetector>(args.models + "/Infantry-v8n.onnx",cam.enemy_color);
+-    }
+-    else
+-    {
+-        cerr << "未知方案 --method " << args.method << " 应为trad/nn" <<endl;
+-        return 1;
+-
+-    }
+-
+-    //第三周:9维EKF跟踪器
+-    Tracker tracker(cfg.plate,cfg.use_theta_obs != 0);
+-
+-    cv::VideoCapture cap(args.input);
+-    if(!cap.isOpened())
+-    {
+-        cerr << "打不开视频:" << args.input << endl;
+-        return 1;
+-    }
+-    const int width = (int)cap.get(cv::CAP_PROP_FRAME_WIDTH);
+-    const int height = (int)cap.get(cv::CAP_PROP_FRAME_HEIGHT);
+-
+-    if(width != cam.image_width || height != cam.image_height)
+-    {
+-        cerr << "视频分辨率" << width << "x" << height << "与标定" << cam.image_width << "x" << cam.image_height << "不一致" << endl;
+-        return 1;
+-    }
+-    const bool use_video_time = args.time_mode == "video";
+-    // 本数据的序号对齐由录制约定和运行结果支持；AVI 头部的 30 fps 与 IMU 时长不一致。
+-    const double n_frames_raw = cap.get(cv::CAP_PROP_FRAME_COUNT);
+-    if(!use_video_time && n_frames_raw > 0.5 && (size_t)llround(n_frames_raw) != imu.size())
+-    {
+-        cerr << "帧数(" << n_frames_raw << ")与IMU行数(" << imu.size() << ")不一致,不能按序号对齐" <<endl;
+-        return 1;
+-    }
+-    const double video_fps = cap.get(cv::CAP_PROP_FPS);
+-    if(use_video_time && (!isfinite(video_fps) || video_fps <= 0.0))
+-    {
+-        cerr << "video 时间模式需要有效的视频帧率\n";
+-        return 1;
+-    }
+-    if(use_video_time)
+-        cerr << "警告: video 模式依赖容器时间；本数据的 30 fps 头部与 IMU 时长不符。\n";
+-    const double fps = use_video_time ? video_fps : imu.meanRate();
+-    printf("视频 %dx%d,%d帧,时间模式 %s,写入帧率 %.3f\n",width,height,
+-           (int)llround(n_frames_raw),args.time_mode.c_str(),fps);
+-
+-    if(args.write_video && !fs::path(args.out).parent_path().empty()) fs::create_directories(fs::path(args.out).parent_path());
+-    if(!fs::path(args.csv).parent_path().empty()) fs::create_directories(fs::path(args.csv).parent_path());
+-
+-    cv::VideoWriter writer;
+-    if(args.write_video) writer.open(args.out,cv::VideoWriter::fourcc('M','J','P','G'),fps,cv::Size(width,height));
+-    if(args.write_video && !writer.isOpened())
+-    {
+-        cerr << "输出视频创建失败:" << args.out << endl;
+-        return 1;
+-    }
+-    ofstream csv(args.csv);
+-    if(!csv.is_open()) { cerr << "输出 CSV 创建失败:" << args.csv << endl; return 1; }
+-    csv << "frame,t,cx,vx,cy,vy,za,vz,theta,omega,r,matched_j,n_meas,n_matched,reinit,pre_reproj_rms_px,pre_z_residual_m\n";
+-
+-    //记录每块板是不是大装甲板
+-    array<bool,4> is_big{{false,false,false,false}} ;
+-
+-    cv::Mat frame;
+-    int fid = 0;
+-    int n_ok = 0;
+-    int n_rejected = 0;
+-    bool incomplete = false;
+-    while (cap.read(frame))
+-    {
+-        if(args.max_frames > 0 && fid >= args.max_frames) break;
+-
+-        // 按录制约定选择时间轴，始终用 cfg.img_imu_offset 查询对应姿态。
+-        double t;
+-        if(use_video_time)
+-        {
+-            const double pos_ms = cap.get(cv::CAP_PROP_POS_MSEC);
+-            const double relative_t = (isfinite(pos_ms) && pos_ms >= 0.0 &&
+-                                       (fid == 0 || pos_ms > 0.0)) ? pos_ms/1000.0 : fid/video_fps;
+-            t = args.video_start_time + relative_t;
+-            //墙钟路径的时间可能跑到 IMU 覆盖范围之外，那一段没有姿态可用，必须停
+-            if(t+cfg.img_imu_offset < imu.tBegin()-1e-6 || t+cfg.img_imu_offset > imu.tEnd()+1e-6)
+-            {
+-                cerr << "第 " << fid << " 帧无对应 IMU 时间覆盖，停止处理\n";
+-                incomplete = true;
+-                break;
+-            }
+-        }
+-        else
+-        {
+-            //每帧一条 IMU;第fid帧的时间戳 = 第fid条IMU的时间
+-            //序号对齐下 fid 一定落在 [0, size-1];查询时刻 t+offset 可能早于首条 9ms,
+-            //这由 quatAt 的边界钳位处理,不能在这里 break(否则第 0 帧就被判出界)
+-            if(fid >= (int)imu.size())
+-            {
+-                cerr << "帧序号超出 IMU 行数，停止处理\n";
+-                incomplete = true;
+-                break;
+-            }
+-            t = imu.timeAt(fid);
+-        }
+-
+-        const auto armors = nn?nn->detect(frame) : trad->detect(frame);
+-
+-        vector<Measurement> ms;
+-        vector<Armor> accepted_armors;
+-        vector<pair<Armor,PoseResult>> results;
+-        for(const auto& armor : armors)
+-        {
+-            const PoseResult pose = solver.solve(armor);
+-            if(args.write_video && args.debug_detections) results.push_back({armor,pose});
+-            if(!poseTrustworthy(pose)) {++n_rejected;continue;}
+-
+-            cv::Mat R_cam_plate;
+-            cv::Rodrigues(pose.rvec,R_cam_plate);
+-
+-            //(板->车心)，theta的参考方向
+-            const Vec3 n_in_cam = matCol(R_cam_plate,2);
+-            //tvec单位是毫米,换米
+-            const Vec3 p_cam(pose.tvec.at<double>(0)/1000.0,pose.tvec.at<double>(1)/1000.0,pose.tvec.at<double>(2)/1000.0);
+-            //平面PnP有镜像解,内法线应背离相机
+-            if(n_in_cam.dot(p_cam) <= 0.0) {++n_rejected;continue;}
+-
+-            Measurement m;
+-            m.p_w = wf.cam_to_world(t,p_cam);
+-            m.theta = thetaFromInwardNormal(wf.R_cam_to_world(t)*n_in_cam);
+-            m.is_big = (armor.size == ArmorSize::BIG);
+-            //armor.number 是数字类别(0~8)，不是车辆身份；单目标场景下拿它做门控，
+-            //一旦某帧把 "4" 识别成 "1"，该帧量测就会被整条丢掉。故保持 target_id = -1(不启用)。
+-            m.variance = measurementVariance(pose,armor,cam,wf.R_cam_to_world(t));
+-            ms.push_back(m);
+-            accepted_armors.push_back(armor);
+-
+-            ++n_ok;
+-        }
+-        //9维EKF跟踪
+-        TrackerDiag diag;
+-        const EkfState* est = tracker.step(t,ms,&diag);
+-
+-        double pre_reproj_rms = numeric_limits<double>::quiet_NaN();
+-        double pre_z_residual = numeric_limits<double>::quiet_NaN();
+-        if(diag.has_prediction && diag.matched_j >= 0 &&
+-           diag.matched_meas >= 0 && diag.matched_meas < (int)ms.size())
+-        {
+-            const Measurement& m = ms[diag.matched_meas];
+-            const Armor& armor = accepted_armors[diag.matched_meas];
+-            pre_z_residual = m.p_w.z - plateWorldPosition(diag.predicted,diag.matched_j,cfg.plate).z;
+-            const double w = m.is_big ? cam.big_width/1000.0 : cam.small_width/1000.0;
+-            const double h = m.is_big ? cam.big_height/1000.0 : cam.small_height/1000.0;
+-            const auto corners = plateCornersWorld(diag.predicted,diag.matched_j,cfg.plate,w,h);
+-            double se = 0.0;
+-            bool visible = true;
+-            for(int k=0;k<4;++k)
+-            {
+-                const Vec3 p(corners[k].x,corners[k].y,corners[k].z);
+-                if(wf.world_to_cam(t,p).z <= 0.05) { visible = false; break; }
+-                const Vec2 uv = wf.project(t,p);
+-                const double dx = uv.x - armor.corners[k].x;
+-                const double dy = uv.y - armor.corners[k].y;
+-                se += dx*dx + dy*dy;
+-            }
+-            if(visible) pre_reproj_rms = sqrt(se/4.0);
+-        }
+-
+-        if(est)
+-        {
+-            if(diag.reinit) is_big.fill(false);
+-            for(int j=0;j<4;++j)
+-            {
+-                const int i = diag.matched_meas_by_plate[j];
+-                if(i >= 0 && i < (int)ms.size()) is_big[j] = ms[i].is_big;
+-            }
+-        }
+-
+-        if(args.write_video && args.debug_detections) Visualizer::drawResults(frame,results);
+-        if(est)
+-        {
+-            if(args.write_video)
+-            {
+-                drawPlates(frame,wf,t,*est,cfg.plate,is_big,cam.small_width/1000.0,cam.small_height/1000.0,cam.big_width/1000.0,cam.big_height/1000.0,diag.matched_j);
+-                drawStateText(frame,*est,fid,diag.matched_j,diag.n_meas);
+-            }
+-
+-            char line[256];
+-            snprintf(line,sizeof(line),"%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%d,%d,%d,%d,%.6f,%.6f\n",fid,t,est->cx,est->vx,est->cy,est->vy,est->za,est->vz,est->theta,est->omega,est->r,diag.matched_j,diag.n_meas,diag.n_matched,diag.reinit?1:0,pre_reproj_rms,pre_z_residual);
+-            csv << line;
+-        }
+-        else
+-        {
+-            csv << fid << "," << t;
+-            for(int k = 0;k < 9;++k)
+-            {
+-                csv << "," ;
+-            }
+-            csv << ",-1," << diag.n_meas << ",0,0,nan,nan\n";
+-        }
+-        if(args.write_video) writer.write(frame);
+-        if(args.show)
+-        {
+-            cv::imshow("rm_week3",frame);
+-            if(cv::waitKey(1) ==27 )   break;
+-        }
++        if(diag.n_matched) ++matched_frames;
++        csv<<fid<<','<<t;
++        if(state) csv<<','<<state->cx<<','<<state->vx<<','<<state->cy<<','<<state->vy<<','<<state->za<<','<<state->vz<<','<<state->theta<<','<<state->omega<<','<<state->r<<','<<state->dr<<','<<state->dh;
++        else for(int k=0;k<VehicleEkf::N;++k) csv<<",nan";
++        csv<<','<<diag.matched_j<<','<<armors.size()<<','<<measurements.size()<<','<<diag.n_matched<<','<<diag.initialization<<','<<diag.reinit<<','<<boundary
++           <<','<<pre<<','<<zres<<','<<pre_all<<','<<post_all<<','<<diag.nis<<','<<diag.nis_dof<<','<<(state&&tracker.ekf().covarianceHealthy());
++        for(int k=0;k<VehicleEkf::N;++k) csv<<','<<(state?tracker.ekf().cov(k,k):NaN);
++        csv<<'\n';
++        if(a.video) writer.write(frame);
+         ++fid;
+-    }
+-    if(args.write_video) writer.release();
+-    csv.close();
+-
+-    printf("共 %d 帧,有效量测 %d 次,质量门丢弃 %d 次,重新初始化 %d 次\n",fid,n_ok,n_rejected,tracker.initCount());
+-    if(tracker.initialized())
+-    {
+-        const EkfState& s = tracker.ekf().state();
+-        printf("最终状态: cx = %.3f cy = %.3f za = %.3f th = %.1fdeg w = %.2f r = %.3f\n",s.cx,s.cy,s.za,rad2deg(s.theta),s.omega,s.r);
+-    }
+-    if(args.write_video) printf("结果: %s,%s\n",args.out.c_str(),args.csv.c_str());
+-    else printf("结果: %s\n",args.csv.c_str());
+-    return incomplete ? 1 : 0;
+-}
++        if(a.show) {cv::imshow("rm_week3",frame);if(cv::waitKey(1)==27){stopped=true;break;}}
++    }
++    if(a.video) writer.release();
++    csv.flush();if(!csv) throw std::runtime_error("CSV write failed");csv.close();
++    bool limited=a.max_frames>0&&fid==a.max_frames;
++    if(!stopped&&!limited&&frames>0&&fid!=frames) throw std::runtime_error("Video decode ended before declared frame count");
++    if(!a.cache.empty()&&!use_cache&&!stopped&&!limited) writeDetectionCache(a.cache,signature,cached);
++    cv::FileStorage meta(a.csv+".meta.json",cv::FileStorage::WRITE|cv::FileStorage::FORMAT_JSON);
++    if(!meta.isOpened()) throw std::runtime_error("Cannot write run metadata");
++    meta<<"frames"<<fid<<"matched_frames"<<matched_frames<<"pose_rejected"<<rejected<<"initializations"<<tracker.initCount()
++        <<"reinitializations"<<std::max(0,tracker.initCount()-1)<<"state_dim"<<VehicleEkf::N<<"time_mode"<<a.mode
++        <<"frame_times"<<a.frame_times<<"timestamp_evidence"<<(a.mode=="timestamps"?"provided_timestamps":"unverified_assumption")
++        <<"time_correspondence_verified"<<0
++        <<"imu_offset_s"<<cfg.img_imu_offset<<"imu_clamped_frames"<<clamped<<"plate_inward_pitch_deg"<<cfg.plate.inward_pitch_deg
++        <<"pitch_constrained"<<cfg.constrain_plate_pitch<<"pair_geometry_estimated"<<cfg.plate.estimate_pair_geometry
++        <<"corner_sigma_px"<<cfg.corner_sigma_px<<"position_floor_m"<<cfg.position_noise_floor_m
++        <<"yaw_floor_deg"<<cfg.yaw_noise_floor_deg<<"imu_attitude_sigma_deg"<<cfg.imu_attitude_sigma_deg
++        <<"video_fingerprint"<<fileFingerprint(a.input)<<"imu_fingerprint"<<fileFingerprint(a.imu)<<"config_fingerprint"<<fileFingerprint(a.camera)
++        <<"detection_signature"<<signature<<"opencv_version"<<CV_VERSION
++        <<"extrinsics"<<"assumed_axis_map_and_configured_lever_arm; not calibrated by this program"
++        <<"translation_reference"<<"IMU origin assumed stationary; no ego translation measurement"
++        <<"full_run"<<(!limited&&!stopped);
++    meta.release();
++    std::cout<<"Processed="<<fid<<" matched_frames="<<matched_frames<<" pose_rejected="<<rejected
++             <<" initializations="<<tracker.initCount()<<" reinitializations="<<std::max(0,tracker.initCount()-1)<<" imu_clamped="<<clamped<<"\n";
++    if(tracker.initialized()) {auto s=tracker.ekf().state();std::cout<<"Final radius="<<s.r<<" dr="<<s.dr<<" dh="<<s.dh<<" omega="<<s.omega<<"\n";}
++    return 0;
++}
++}
++int main(int argc,char** argv) {
++    try {return run(parse(argc,argv));}catch(const std::exception& e) {std::cerr<<"Error: "<<e.what()<<'\n';return 1;}
++}
+--- a/src/pnp_solver.cpp
++++ b/src/pnp_solver.cpp
+@@ -1,57 +1,38 @@
+ #include "pnp_solver.hpp"
+-
++#include <opencv2/calib3d.hpp>
++#include <opencv2/imgproc.hpp>
++#include <algorithm>
+ #include <cmath>
+-#include <opencv2/calib3d.hpp>     //  solvePnP / projectPoints 在 calib3d 模块
+-
+-PnpSolver::PnpSolver(const CameraParams& params) : params_(params)
+-{
+-    //  以板中心为原点、z=0 平面构造 3D 角点, 顺序与 Armor::corners 契约一致
+-    //  先转 float 再构造 Point3f: 避免 double 到 float 的 narrowing conversion 编译报错
+-    const float sw = static_cast<float>(params.small_width  / 2.0);
+-    const float sh = static_cast<float>(params.small_height / 2.0);
+-    small_obj_ = {cv::Point3f(-sw, -sh, 0), cv::Point3f(sw, -sh, 0),
+-                  cv::Point3f(sw, sh, 0),   cv::Point3f(-sw, sh, 0)};
+-
+-    const float bw = static_cast<float>(params.big_width  / 2.0);
+-    const float bh = static_cast<float>(params.big_height / 2.0);
+-    big_obj_   = {cv::Point3f(-bw, -bh, 0), cv::Point3f(bw, -bh, 0),
+-                  cv::Point3f(bw, bh, 0),   cv::Point3f(-bw, bh, 0)};
++PnpSolver::PnpSolver(const CameraParams& p):params_(p) {
++    auto points=[](double w,double h) {return std::vector<cv::Point3f>{
++        {float(-w/2),float(-h/2),0},{float(w/2),float(-h/2),0},
++        {float(w/2),float(h/2),0},{float(-w/2),float(h/2),0}};};
++    small_obj_=points(p.small_width,p.small_height);big_obj_=points(p.big_width,p.big_height);
+ }
+-
+-PoseResult PnpSolver::solve(const Armor& armor) const
+-{
+-    PoseResult res;
+-    if (armor.corners.size() != 4) return res;      //  异常: 角点不全
+-
+-    const auto& obj = (armor.size == ArmorSize::BIG) ? big_obj_ : small_obj_;
+-
+-    try
+-    {
+-        //  IPPE 专为平面四点目标设计, 比 ITERATIVE 更稳且无需初值
+-        const bool ok = cv::solvePnP(obj, armor.corners,
+-                                     params_.camera_matrix, params_.dist_coeffs,
+-                                     res.rvec, res.tvec, false, cv::SOLVEPNP_IPPE);
+-        if (!ok) return res;
+-
+-        //  平面目标存在镜像歧义, z<=0 说明解到相机背后, 直接判失败
+-        if (res.tvec.at<double>(2) <= 0) return res;
+-
+-        //  用同一内外参把 3D 点投回像素平面, 算重投影 RMS 作为质量门
+-        std::vector<cv::Point2f> reproj;
+-        cv::projectPoints(obj, res.rvec, res.tvec,
+-                          params_.camera_matrix, params_.dist_coeffs, reproj);
+-        double se = 0.0;
+-        for (int i = 0; i < 4; ++i)
+-        {
+-            const cv::Point2f d = reproj[i] - armor.corners[i];
+-            se += d.x * d.x + d.y * d.y;
++std::vector<PoseResult> PnpSolver::solveCandidates(const Armor& a) const {
++    std::vector<PoseResult> out;
++    if(a.corners.size()!=4) return out;
++    for(const auto& p:a.corners) if(!std::isfinite(p.x)||!std::isfinite(p.y)) return out;
++    if(!cv::isContourConvex(a.corners) || std::abs(cv::contourArea(a.corners))<4) return out;
++    const auto& obj=a.size==ArmorSize::BIG?big_obj_:small_obj_;
++    try {
++        std::vector<cv::Mat> rs,ts;
++        cv::solvePnPGeneric(obj,a.corners,params_.camera_matrix,params_.dist_coeffs,
++                            rs,ts,false,cv::SOLVEPNP_IPPE);
++        for(size_t i=0;i<rs.size();++i) {
++            if(!cv::checkRange(rs[i])||!cv::checkRange(ts[i])||ts[i].at<double>(2)<=0) continue;
++            cv::Mat R;cv::Rodrigues(rs[i],R);
++            if(R.col(2).dot(ts[i])<=0) continue;
++            bool valid=true;
++            for(const auto& p:obj) if(R.at<double>(2,0)*p.x+R.at<double>(2,1)*p.y+ts[i].at<double>(2)<=0) valid=false;
++            if(!valid) continue;
++            std::vector<cv::Point2f> uv;cv::projectPoints(obj,rs[i],ts[i],params_.camera_matrix,params_.dist_coeffs,uv);
++            double se=0;for(int k=0;k<4;++k) {auto d=uv[k]-a.corners[k];se+=d.dot(d);}
++            PoseResult p;p.ok=true;p.rvec=rs[i].clone();p.tvec=ts[i].clone();p.rms_px=std::sqrt(se/4);out.push_back(p);
+         }
+-        res.rms_px = std::sqrt(se / 4.0);
+-        res.ok = true;
+-    }
+-    catch (const cv::Exception&)
+-    {
+-        res.ok = false;     //  异常: solvePnP 数值失败, 不让程序崩
+-    }
+-    return res;
++    } catch(const cv::Exception&) { out.clear(); }
++    std::sort(out.begin(),out.end(),[](const auto& a,const auto& b){return a.rms_px<b.rms_px;});return out;
+ }
++PoseResult PnpSolver::solve(const Armor& a) const {
++    auto c=solveCandidates(a);return c.empty()?PoseResult():c.front();
++}
+--- a/src/pose_estimator.cpp
++++ b/src/pose_estimator.cpp
+@@ -0,0 +1,129 @@
++#include "pose_estimator.hpp"
++#include "measurement.hpp"
++#include <opencv2/calib3d.hpp>
++#include <algorithm>
++#include <cmath>
++#include <functional>
++#include <limits>
++namespace rmv {
++namespace {
++cv::Mat cvMatrix(const Mat3& r) {
++    cv::Mat m(3,3,CV_64F);for(int i=0;i<3;++i) for(int j=0;j<3;++j) m.at<double>(i,j)=r.m[i][j];return m;
++}
++Vec3 column(const cv::Mat& r,int k) {return {r.at<double>(0,k),r.at<double>(1,k),r.at<double>(2,k)};}
++using Project=std::function<bool(const cv::Mat&,cv::Mat&)>;
++bool jacobian(const cv::Mat& x,const Project& project,cv::Mat& j) {
++    cv::Mat initial;if(!project(x,initial)) return false;
++    j=cv::Mat(initial.rows,x.rows,CV_64F);
++    for(int k=0;k<x.rows;++k) {
++        const double step=k<3?1e-5:1e-5;
++        auto a=x.clone(),b=x.clone();a.at<double>(k)+=step;b.at<double>(k)-=step;
++        cv::Mat pa,pb;if(!project(a,pa)||!project(b,pb)) return false;
++        cv::Mat col=(pa-pb)/(2*step);col.copyTo(j.col(k));
++    }return true;
++}
++bool fit(cv::Mat& x,const cv::Mat& observed,const Project& project,double& se) {
++    cv::Mat predicted;if(!project(x,predicted)) return false;
++    se=cv::norm(predicted-observed,cv::NORM_L2SQR);double damping=1e-3;
++    for(int iteration=0;iteration<25;++iteration) {
++        cv::Mat j;if(!jacobian(x,project,j)) return false;
++        cv::Mat h=j.t()*j,g=j.t()*(predicted-observed),system=h.clone(),delta;
++        for(int k=0;k<x.rows;++k) system.at<double>(k,k)+=damping*std::max(1.,h.at<double>(k,k));
++        if(!cv::solve(system,-g,delta,cv::DECOMP_CHOLESKY)) return false;
++        auto candidate=x+delta;cv::Mat next;
++        if(project(candidate,next)) {
++            double cost=cv::norm(next-observed,cv::NORM_L2SQR);
++            if(cost<se) {
++                x=candidate;predicted=next;double improvement=se-cost;se=cost;
++                damping=std::max(1e-9,damping*.3);
++                if(cv::norm(delta)<1e-7 || improvement<1e-9) break;
++                continue;
++            }
++        }
++        damping*=10;if(damping>1e10) break;
++    }return true;
++}
++}
++PoseEstimator::PoseEstimator(const CameraParams& c,const W3Config& g):camera_(c),config_(g),pnp_(c) {}
++PoseMeasurement PoseEstimator::estimate(const Armor& armor,double t,const WorldFrame& wf) const {
++    PoseMeasurement out;auto candidates=pnp_.solveCandidates(armor);out.candidates=static_cast<int>(candidates.size());
++    if(candidates.empty()) return out;
++    const Mat3 rw=wf.R_cam_to_world(t);const cv::Mat Rcw=cvMatrix(rw);
++    const double w=(armor.size==ArmorSize::BIG?camera_.big_width:camera_.small_width)/1000.;
++    const double h=(armor.size==ArmorSize::BIG?camera_.big_height:camera_.small_height)/1000.;
++    const std::vector<cv::Point3d> object{{-w/2,-h/2,0},{w/2,-h/2,0},{w/2,h/2,0},{-w/2,h/2,0}};
++    cv::Mat observed(8,1,CV_64F);for(int k=0;k<4;++k) {observed.at<double>(2*k)=armor.corners[k].x;observed.at<double>(2*k+1)=armor.corners[k].y;}
++    const bool constrained=config_.constrain_plate_pitch;const int n=6;
++    auto rotation=[&](const cv::Mat& x) {
++        cv::Mat R;
++        cv::Rodrigues(x.rowRange(3,6),R);
++        return R;
++    };
++    Project project=[&](const cv::Mat& x,cv::Mat& uv) {
++        if(!cv::checkRange(x)||x.at<double>(2)<=.05) return false;
++        cv::Mat R=rotation(x),r;cv::Rodrigues(R,r);
++        for(const auto& p:object) if(R.at<double>(2,0)*p.x+R.at<double>(2,1)*p.y+x.at<double>(2)<=.05) return false;
++        std::vector<cv::Point2d> points;cv::projectPoints(object,r,x.rowRange(0,3),camera_.camera_matrix,camera_.dist_coeffs,points);
++        uv=cv::Mat::zeros(constrained?10:8,1,CV_64F);
++        for(int k=0;k<4;++k) {uv.at<double>(2*k)=points[k].x/config_.corner_sigma_px;uv.at<double>(2*k+1)=points[k].y/config_.corner_sigma_px;}
++        if(constrained) {
++            Vec3 normal=rw*column(R,2),tangent=rw*column(R,0);
++            double pitch=std::atan2(normal.z,std::hypot(normal.x,normal.y));
++            // Soft installation priors tolerate uncalibrated roll and modest chassis tilt.
++            // A hard 15-degree constraint is inappropriate with assumed camera/IMU extrinsics.
++            uv.at<double>(8)=(pitch-deg2rad(config_.plate.inward_pitch_deg))/deg2rad(config_.plate_pitch_sigma_deg);
++            uv.at<double>(9)=std::asin(std::clamp(tangent.z,-1.,1.))/deg2rad(config_.plate_roll_sigma_deg);
++        }
++        return cv::checkRange(uv);
++    };
++    cv::Mat target=cv::Mat::zeros(constrained?10:8,1,CV_64F);
++    cv::Mat scaled=observed/config_.corner_sigma_px;scaled.copyTo(target.rowRange(0,8));
++    cv::Mat best;double best_cost=std::numeric_limits<double>::infinity();
++    for(const auto& candidate:candidates) {
++        cv::Mat rawR;cv::Rodrigues(candidate.rvec,rawR);Vec3 normal=rw*column(rawR,2);
++        double raw_pitch=rad2deg(std::atan2(normal.z,std::hypot(normal.x,normal.y)));
++        cv::Mat x(n,1,CV_64F);cv::Mat translation=candidate.tvec/1000.;translation.copyTo(x.rowRange(0,3));
++        candidate.rvec.copyTo(x.rowRange(3,6));
++        double cost;if(!fit(x,target,project,cost)) continue;
++        // Compare both refined candidates under identical pixel and installation weights.
++        double score=cost;
++        if(!constrained) score+=std::pow((raw_pitch-config_.plate.inward_pitch_deg)/5.,2);
++        if(score<best_cost) {best_cost=score;best=x.clone();out.raw_pitch_deg=raw_pitch;out.raw_rms_px=candidate.rms_px;}
++    }
++    if(best.empty()) return out;
++    cv::Mat uv,J;if(!project(best,uv)||!jacobian(best,project,J)) return out;
++    const double se=cv::norm(uv.rowRange(0,8)-scaled,cv::NORM_L2SQR)*config_.corner_sigma_px*config_.corner_sigma_px;
++    cv::Mat R=rotation(best),rvec;cv::Rodrigues(R,rvec);
++    // Reject a refinement that flips the inward face to the camera.
++    if(R.col(2).dot(best.rowRange(0,3))<=0) return out;
++    out.pose={true,rvec.clone(),best.rowRange(0,3)*1000.,std::sqrt(se/4.)};
++    if(out.pose.rms_px>4. || cv::norm(best.rowRange(0,3))>15.) return out;
++    auto& m=out.measurement;
++    const Vec3 pcam(best.at<double>(0),best.at<double>(1),best.at<double>(2));m.p_w=wf.cam_to_world(t,pcam);
++    const Vec3 normal=rw*column(R,2);m.theta=std::atan2(normal.y,normal.x);m.is_big=armor.size==ArmorSize::BIG;
++    cv::Mat inverse;cv::SVD svd(J,cv::SVD::NO_UV);
++    if(svd.w.at<double>(n-1)<1e-7 || !cv::invert(J.t()*J,inverse,cv::DECOMP_SVD)) return out;
++    // J is whitened by corner uncertainty and the soft mechanical-prior uncertainty.
++    const double inflation=std::max(1.,cv::norm(uv-target,cv::NORM_L2SQR)/std::max(1,uv.rows-n));
++    cv::Mat A=cv::Mat::zeros(4,n,CV_64F);Rcw.copyTo(A(cv::Rect(0,0,3,3)));
++    {
++        for(int k=3;k<6;++k) {
++            auto a=best.clone(),b=best.clone();a.at<double>(k)+=1e-5;b.at<double>(k)-=1e-5;
++            Vec3 na=rw*column(rotation(a),2),nb=rw*column(rotation(b),2);
++            A.at<double>(3,k)=wrapAngle(std::atan2(na.y,na.x)-std::atan2(nb.y,nb.x))/2e-5;
++        }
++    }
++    cv::Mat covariance=A*(inflation*inverse)*A.t();
++    for(int i=0;i<4;++i) for(int j=0;j<4;++j) m.covariance[i*4+j]=.5*(covariance.at<double>(i,j)+covariance.at<double>(j,i));
++    for(int k=0;k<3;++k) m.covariance[k*4+k]+=config_.position_noise_floor_m*config_.position_noise_floor_m;
++    m.covariance[15]+=std::pow(deg2rad(config_.yaw_noise_floor_deg),2);
++    const double sigma=deg2rad(config_.imu_attitude_sigma_deg);
++    const Vec3 axes[3]={{1,0,0},{0,1,0},{0,0,1}};
++    for(int k=0;k<3;++k) {
++        Vec3 dp=axes[k].cross(m.p_w)*sigma,dn=axes[k].cross(normal)*sigma;
++        m.shared_noise[k]=dp.x;m.shared_noise[3+k]=dp.y;m.shared_noise[6+k]=dp.z;
++        m.shared_noise[9+k]=(normal.x*dn.y-normal.y*dn.x)/(normal.x*normal.x+normal.y*normal.y);
++    }
++    out.ok=true;return out;
++}
++}
+--- a/src/state_visualizer.cpp
++++ b/src/state_visualizer.cpp
+@@ -23,10 +23,8 @@
+     const Vec3 c_b = plateWorldPosition(s, j, g);
+ 
+     //  板坐标系:Z 指向车心(内法线),Y 向下,X = Y x Z
+-    const Vec3 Z(std::cos(a), std::sin(a), 0.0);
+-    const Vec3 Y(0.0, 0.0, -1.0);
+-    const Vec3 X = Y.cross(Z).normalized();
+-    const Vec3 Yu = Z.cross(X);            //  重新正交化,防数值漂移
++    const Mat3 rotation=plateRotationWorld(a,deg2rad(g.inward_pitch_deg));
++    const Vec3 X=rotation.col(0),Yu=rotation.col(1);
+ 
+     const double hw = width_m / 2.0;
+     const double hh = height_m / 2.0;
+@@ -114,6 +112,8 @@
+     put(buf);
+     std::snprintf(buf, sizeof(buf), "r  %.3f", s.r);
+     put(buf);
++    std::snprintf(buf, sizeof(buf), "dr %+.3f dh %+.3f",s.dr,s.dh);
++    put(buf);
+     //  没有融合成功的帧,四块板全是按状态外推出来的,必须标出来;
+     //  否则"预测"会被误读成"检测框标错了位置"
+     if (matched_j < 0)
+--- a/src/tracker.cpp
++++ b/src/tracker.cpp
+@@ -1,217 +1,76 @@
+ #include "tracker.hpp"
+ #include "measurement.hpp"
++#include "small_matrix.hpp"
+ #include <algorithm>
+ #include <cmath>
+-using namespace std;
+-
+-namespace rmv
+-{
+-    Tracker::Tracker(const PlateGeometry& geo,bool use_theta_obs,double gate_pos,double gate_ang_deg,int max_skip):geo_(geo),use_theta_obs_(use_theta_obs),gate_pos_(gate_pos),gate_ang_(deg2rad(gate_ang_deg)),max_skip_(max_skip),ekf_(geo,use_theta_obs)
+-    {
+-
++#include <stdexcept>
++namespace rmv {
++Tracker::Tracker(const PlateGeometry& g,bool a,double gp,double ga,int skip)
++    :geo_(g),use_theta_obs_(a),gate_pos_(gp),gate_ang_(deg2rad(ga)),max_skip_(skip),ekf_(g,a) {}
++void Tracker::initFrom(const Measurement& m,double t) {
++    ekf_=VehicleEkf(geo_,use_theta_obs_);auto c=m.totalCovariance();
++    ekf_.initFromMeasurement(m.p_w,m.theta,0,t,c.data());
++    target_id_=m.target_id;init_=true;last_t_=t;skip_=0;++n_init_;
++}
++void Tracker::fillZ(const Measurement& m,double* z) const {
++    z[0]=m.p_w.x;z[1]=m.p_w.y;z[2]=m.p_w.z;if(use_theta_obs_) z[3]=m.theta;
++}
++std::vector<Tracker::Pair> Tracker::match(const std::vector<Measurement>& ms) const {
++    std::vector<Pair> out;
++    for(int j=0;j<4;++j) {
++        const auto p=plateWorldPosition(ekf_.state(),j,geo_);
++        double angle=plateThetaMeas(ekf_.state(),j,geo_);
++        for(int i=0;i<(int)ms.size();++i) {
++            if(target_id_>=0 && ms[i].target_id>=0 && ms[i].target_id!=target_id_) continue;
++            double dp=std::hypot(ms[i].p_w.x-p.x,ms[i].p_w.y-p.y);
++            double da=std::abs(wrapAngle(ms[i].theta-angle));
++            if(dp>gate_pos_ || (use_theta_obs_ && da>gate_ang_)) continue;
++            double z[4]={};fillZ(ms[i],z);auto c=ms[i].totalCovariance();
++            double d2=ekf_.mahalanobis(j,z,ekf_.obsDim(),c.data());
++            if(std::isfinite(d2) && d2<=small::chiSquareGate(ekf_.obsDim())) out.push_back({d2,i,j});
++        }
+     }
+-    void Tracker::initFrom(const Measurement& m,double t)
+-    {
+-        ekf_ = Ekf9(geo_,use_theta_obs_);
+-        ekf_.initFromMeasurement(m.p_w,m.theta,0,t,m.variance.data());
+-        target_id_ = m.target_id;
+-        init_ = true;
+-        last_t_ = t;
+-        skip_ = 0;
+-        ++n_init_;
++    std::sort(out.begin(),out.end(),[](const Pair& a,const Pair& b){
++        if(a.cost!=b.cost) return a.cost<b.cost;
++        return a.plate!=b.plate?a.plate<b.plate:a.meas<b.meas;
++    });return out;
++}
++const EkfState* Tracker::step(double t,const std::vector<Measurement>& ms,TrackerDiag* diag) {
++    if(!std::isfinite(t)) throw std::invalid_argument("Nonfinite image timestamp");
++    TrackerDiag d;d.n_meas=static_cast<int>(ms.size());
++    auto initialize=[&] {
++        initFrom(ms.front(),t);d.initialization=true;d.reinit=n_init_>1;
++        d.matched_j=0;d.matched_meas=0;d.n_matched=1;d.matched_meas_by_plate[0]=0;
++    };
++    auto finish=[&]() -> const EkfState* { if(diag) *diag=d;return init_?&ekf_.state():nullptr; };
++    if(!init_) { if(!ms.empty()) initialize();return finish(); }
++    double dt=t-last_t_;
++    if(dt<=0) throw std::invalid_argument("Image timestamps must be strictly increasing");
++    if(dt>.2) { init_=false;skip_=0;if(!ms.empty()) initialize();last_t_=t;return finish(); }
++    ekf_.predict(dt);last_t_=t;d.predicted=ekf_.state();d.has_prediction=true;
++    const auto candidates=match(ms);
++    std::vector<bool> used(ms.size(),false);std::array<bool,4> used_plate{};
++    std::vector<Pair> selected;
++    for(const auto& p:candidates) if(!used[p.meas] && !used_plate[p.plate]) {
++        selected.push_back(p);used[p.meas]=true;used_plate[p.plate]=true;
+     }
+-    void Tracker::fillZ(const Measurement& m,double* z) const
+-    {
+-        z[0] = m.p_w.x;
+-        z[1] = m.p_w.y;
+-        z[2] = m.p_w.z;
+-        if(use_theta_obs_) z[3] = m.theta;
+-
++    // All pairs use the same prediction. A joint update retains same-frame correlations.
++    // If the joint gate fails, remove the least compatible pair and retry transactionally.
++    while(!selected.empty()) {
++        std::vector<PlateObservation> observations;
++        for(const auto& p:selected) observations.push_back({p.plate,ms[p.meas]});
++        if(ekf_.updateBatch(observations)) break;
++        selected.pop_back();
+     }
+-    vector<Tracker::Pair>Tracker::match(const vector<Measurement>& ms) const
+-    {
+-        const EkfState& s = ekf_.state();
+-        vector<Pair>out;
+-
+-        for(int j = 0;j<4;++j)
+-        {
+-            const Vec3 pred = plateWorldPosition(s,j,geo_);
+-            const double pred_ang = plateThetaMeas(s,j,geo_);
+-
+-            for(int i = 0;i<(int)ms.size();++i)
+-            {
+-                if(target_id_ >= 0 && ms[i].target_id >= 0 && ms[i].target_id != target_id_)
+-                    continue;
+-                const double dx = ms[i].p_w.x - pred.x;
+-                const double dy = ms[i].p_w.y - pred.y;
+-                const double dp = sqrt(dx*dx+dy*dy);
+-                const double da = fabs(wrapAngle(ms[i].theta - pred_ang));
+-
+-                //先过宽松几何门，再用马氏距离排序
+-                if(dp>gate_pos_ || da>gate_ang_)
+-                {
+-                    continue;
+-                }
+-                double z[4] = {0.0};
+-                fillZ(ms[i],z);
+-                const double d2 = ekf_.mahalanobis(j,z,ekf_.obsDim(),ms[i].variance.data());
+-                const double chi2_gate = use_theta_obs_?18.47:16.27;
+-
+-                if(d2>chi2_gate)
+-                {
+-                    continue;
+-                }
+-                Pair p;
+-                p.cost = d2;
+-                p.meas = i;
+-                p.plate = j;
+-                out.push_back(p);
+-            }
+-        }
+-        sort(out.begin(),out.end(),[](const Pair& a,const Pair& b){return a.cost < b.cost;});
+-        return out;
++    if(!selected.empty()) {
++        skip_=0;d.n_matched=static_cast<int>(selected.size());
++        d.matched_j=selected.front().plate;d.matched_meas=selected.front().meas;
++        for(const auto& p:selected) d.matched_meas_by_plate[p.plate]=p.meas;
++        d.nis=ekf_.lastNis();d.nis_dof=ekf_.lastDof();
++    } else {
++        ++skip_;d.skip=true;
++        if(skip_>=max_skip_) { init_=false;if(!ms.empty()) initialize(); }
+     }
+-    const EkfState* Tracker::step(double t,const vector<Measurement>& ms,TrackerDiag* diag)
+-    {
+-        TrackerDiag d;
+-        d.n_meas = (int)ms.size();
+-
+-        if(!init_)
+-        {
+-            if(!ms.empty())
+-            {
+-                initFrom(ms.front(),t);
+-                d.matched_j = 0;
+-                d.matched_meas = 0;
+-                d.n_matched = 1;
+-                d.matched_meas_by_plate[0] = 0;
+-                d.reinit = true;
+-            }
+-            if(diag) *diag = d;
+-            return init_?&ekf_.state():nullptr;
+-        }
+-        //---预测---
+-        double dt = t - last_t_;
+-        if(!isfinite(dt) || dt <= 0.0)
+-        {
+-            dt = 1e-3;
+-        }
+-        if(dt > 0.2)
+-        {
+-            init_ = false;
+-            skip_ = 0;
+-            if(!ms.empty())
+-            {
+-                initFrom(ms.front(),t);
+-                d.matched_j = 0;
+-                d.matched_meas = 0;
+-                d.n_matched = 1;
+-                d.matched_meas_by_plate[0] = 0;
+-                d.reinit = true;
+-            }
+-            last_t_ = t;
+-            if(diag) *diag = d;
+-            return init_? &ekf_.state():nullptr;
+-
+-        }
+-        ekf_.predict(dt);
+-        d.predicted = ekf_.state();
+-        d.has_prediction = true;
+-        last_t_ = t;
+-
+-        if(ms.empty())
+-        {
+-            ++skip_;
+-            d.skip = true;
+-            if(skip_>=max_skip_)
+-            {
+-                init_ = false;     //下帧有量测就重捕
+-
+-            }
+-            if(diag) 
+-            {
+-                *diag = d;
+-            }
+-            return init_? &ekf_.state() : nullptr;
+-        }
+-        const vector<Pair> pairs = match(ms);
+-        if(pairs.empty())
+-        {
+-            ++skip_;
+-            d.skip = true;
+-            if(skip_>=max_skip_)
+-            {
+-                initFrom(ms.front(),t );
+-                d.reinit = true;
+-                d.matched_j = 0;
+-                d.matched_meas = 0;
+-                d.n_matched = 1;
+-                d.matched_meas_by_plate[0] = 0;
+-            }
+-            if(diag)
+-            {
+-                *diag = d;
+-            }
+-            return &ekf_.state();
+-        }
+-        vector<bool> used_meas(ms.size(),false);
+-        vector<bool> used_plate(4,false);
+-        for(int accepted = 0; accepted < 4; ++accepted)
+-        {
+-            // 每次状态更新后重算关联代价，避免后续候选沿用旧状态的门控结果。
+-            const vector<Pair> current = match(ms);
+-            auto it = find_if(current.begin(),current.end(),[&](const Pair& p) {
+-                return !used_meas[p.meas] && !used_plate[p.plate];
+-            });
+-            if(it == current.end()) break;
+-            const Pair p = *it;
+-            if(used_meas[p.meas] || used_plate[p.plate])
+-            {
+-                continue;
+-            }
+-            double z[4] = {0.0};
+-            fillZ(ms[p.meas],z);
+-            const int dim = ekf_.obsDim();
+-            if(!ekf_.update(p.plate,z,dim,ms[p.meas].variance.data()))
+-            {
+-                used_meas[p.meas] = true;
+-                continue;
+-            }
+-            
+-            used_meas[p.meas] = true;
+-            used_plate[p.plate] = true;
+-            ++d.n_matched;
+-            d.matched_meas_by_plate[p.plate] = p.meas;
+-            if(d.matched_j < 0)
+-            {
+-                d.matched_j = p.plate;
+-                d.matched_meas = p.meas;
+-            }
+-        }
+-        if(d.n_matched == 0)
+-        {
+-            ++skip_;
+-            d.skip = true;
+-            if(skip_ >= max_skip_)
+-            {
+-                initFrom(ms.front(),t);
+-                d.matched_j = 0;
+-                d.matched_meas = 0;
+-                d.n_matched = 1;
+-                d.matched_meas_by_plate[0] = 0;
+-                d.reinit = true;
+-
+-            }
+-        }
+-        else
+-        {
+-            skip_ = 0;
+-        }
+-        if(diag) *diag = d;
+-        return &ekf_.state();
+-
+-        
+-        
+-    }
+-
+-}       // namespace rmv
++    return finish();
++}
++}
+--- a/src/w3_config_loader.cpp
++++ b/src/w3_config_loader.cpp
+@@ -1,94 +1,61 @@
+ #include "w3_config_loader.hpp"
+-#include<opencv2/core.hpp>
+-#include<iostream>
+-using namespace std;
+-
+-namespace rmv
+-{
+-    namespace
+-    {
+-        //矩阵拷入定长数组
+-        bool copyMat(const cv::FileNode& node,double* dst,int rows,int cols)
+-
+-        {
+-            if(node.empty())
+-            {
+-                return false;
+-            }
+-            cv::Mat m;
+-            node >> m;
+-            if(m.rows != rows || m.cols != cols)
+-            {
+-                return false;
+-            }
+-            m.convertTo(m,CV_64F);
+-            for(int i = 0;i < rows;++i)
+-            {
+-                for(int j = 0;j < cols;++j)
+-                {
+-                    dst[i*cols+j] = m.at<double>(i,j);
+-
+-                }
+-            }
+-            return true;
+-        }
+-        //读一个标量，不存在就保留原值
+-        void readDouble(const cv::FileNode& node,double& dst)
+-        {
+-            if(!node.empty())
+-            {
+-                node >> dst;
+-            }
+-        }
+-     
+-
+-    }   //namespace 
+-    bool loadW3Config(const string& path,W3Config& cfg)
+-    {
+-        cv::FileStorage fs(path,cv::FileStorage::READ);
+-        if(!fs.isOpened())
+-        {
+-            cerr<<"配置文件打开失败: "<<path<<endl;
+-            return false;
+-        }
+-        copyMat(fs["camera_matrix"],cfg.K,3,3);
+-        copyMat(fs["dist_coeffs"],cfg.D,1,5);
+-        copyMat(fs["R_ci"],cfg.R_ci,3,3);
+-        copyMat(fs["t_ic"],cfg.t_ic,1,3);
+-
+-        readDouble(fs["img_imu_offset"],cfg.img_imu_offset);
+-        readDouble(fs["plate_radius"],cfg.plate.radius);
+-
+-        int use_theta = cfg.use_theta_obs;
+-        if(!fs["use_theta_obs"].empty())
+-        {
+-            fs["use_theta_obs"] >> use_theta;
+-            cfg.use_theta_obs = use_theta;
+-        }
+-        double buf[4] = {0.0};
+-        if(copyMat(fs["plate_radius_offset"],buf,1,4))
+-        {
+-            for(int j = 0;j < 4;++j)
+-            {
+-                cfg.plate.radius_offset[j] = buf[j];
+-            }
+-        }
+-         if(copyMat(fs["plate_phase_deg"],buf,1,4))
+-        {
+-            for(int j = 0;j < 4;++j)
+-            {
+-                cfg.plate.phase_deg[j] = buf[j];
+-            }
+-        }
+-         if(copyMat(fs["plate_dh"],buf,1,4))
+-        {
+-            for(int j = 0;j < 4;++j)
+-            {
+-                cfg.plate.dh[j] = buf[j];
+-            }
++#include <opencv2/core.hpp>
++#include <iostream>
++#include <cmath>
++#include <stdexcept>
++namespace rmv {
++namespace {
++void matrix(const cv::FileStorage& f,const char* key,double* out,int rows,int cols,bool required=false) {
++    if(f[key].empty()) {if(required) throw std::runtime_error(std::string("Missing ")+key);return;}
++    cv::Mat m;f[key]>>m;
++    if(m.rows!=rows || m.cols!=cols || m.channels()!=1) throw std::runtime_error(std::string("Invalid shape: ")+key);
++    m.convertTo(m,CV_64F);if(!cv::checkRange(m)) throw std::runtime_error(std::string("Nonfinite ")+key);
++    for(int i=0;i<rows;++i) for(int j=0;j<cols;++j) out[i*cols+j]=m.at<double>(i,j);
++}
++void scalar(const cv::FileStorage& f,const char* key,double& value) {
++    if(!f[key].empty()) f[key]>>value;
++    if(!std::isfinite(value)) throw std::runtime_error(std::string("Nonfinite ")+key);
++}
++void boolean(const cv::FileStorage& f,const char* key,bool& value) {
++    if(f[key].empty()) return;
++    int n;f[key]>>n;
++    if(n!=0 && n!=1) throw std::runtime_error(std::string("Boolean must be 0/1: ")+key);
++    value=n!=0;
++}
++}
++bool loadW3Config(const std::string& path,W3Config& cfg) {
++    try {
++        cv::FileStorage f(path,cv::FileStorage::READ);if(!f.isOpened()) return false;
++        matrix(f,"camera_matrix",cfg.K,3,3,true);matrix(f,"dist_coeffs",cfg.D,1,5,true);
++        matrix(f,"R_ci",cfg.R_ci,3,3);matrix(f,"t_ic",cfg.t_ic,1,3);
++        matrix(f,"plate_radius_offset",cfg.plate.radius_offset.data(),1,4);
++        matrix(f,"plate_phase_deg",cfg.plate.phase_deg.data(),1,4);matrix(f,"plate_dh",cfg.plate.dh.data(),1,4);
++        scalar(f,"img_imu_offset",cfg.img_imu_offset);scalar(f,"plate_radius",cfg.plate.radius);
++        scalar(f,"radius_min",cfg.plate.radius_min);scalar(f,"radius_max",cfg.plate.radius_max);
++        scalar(f,"plate_inward_pitch_deg",cfg.plate.inward_pitch_deg);
++        scalar(f,"corner_sigma_px",cfg.corner_sigma_px);scalar(f,"position_noise_floor_m",cfg.position_noise_floor_m);
++        scalar(f,"yaw_noise_floor_deg",cfg.yaw_noise_floor_deg);scalar(f,"imu_attitude_sigma_deg",cfg.imu_attitude_sigma_deg);
++        scalar(f,"plate_pitch_sigma_deg",cfg.plate_pitch_sigma_deg);scalar(f,"plate_roll_sigma_deg",cfg.plate_roll_sigma_deg);
++        scalar(f,"traditional_corner_sigma_px",cfg.traditional_corner_sigma_px);
++        scalar(f,"traditional_position_floor_m",cfg.traditional_position_floor_m);
++        scalar(f,"traditional_yaw_floor_deg",cfg.traditional_yaw_floor_deg);
++        boolean(f,"constrain_plate_pitch",cfg.constrain_plate_pitch);
++        boolean(f,"estimate_pair_geometry",cfg.plate.estimate_pair_geometry);
++        bool angle=cfg.use_theta_obs!=0;boolean(f,"use_theta_obs",angle);cfg.use_theta_obs=angle;
++        cv::Mat r(3,3,CV_64F,cfg.R_ci);
++        if(cv::norm(r.t()*r-cv::Mat::eye(3,3,CV_64F))>1e-6 || std::abs(cv::determinant(r)-1)>1e-6)
++            throw std::runtime_error("R_ci must be a proper rotation");
++        if(cfg.plate.radius_min<=0 || cfg.plate.radius_max<=cfg.plate.radius_min ||
++           cfg.corner_sigma_px<=0 || cfg.position_noise_floor_m<=0 || cfg.yaw_noise_floor_deg<=0 ||
++           cfg.imu_attitude_sigma_deg<0 || cfg.plate_pitch_sigma_deg<=0 || cfg.plate_roll_sigma_deg<=0 ||
++           cfg.traditional_corner_sigma_px<=0 || cfg.traditional_position_floor_m<=0 || cfg.traditional_yaw_floor_deg<=0 ||
++           std::abs(cfg.plate.inward_pitch_deg)>=60)
++            throw std::runtime_error("Invalid geometry/noise configuration");
++        for(int j=0;j<4;++j) {
++            double rj=cfg.plate.radius+cfg.plate.radius_offset[j];
++            if(rj<cfg.plate.radius_min || rj>cfg.plate.radius_max) throw std::runtime_error("Initial radius outside mechanical bounds");
+         }
+         return true;
+-
+-    }
+-    
+-}   //namespace rmv
++    } catch(const std::exception& e) {std::cerr<<"Invalid week3 configuration: "<<e.what()<<"\n";return false;}
++}
++}
+--- a/tests/test_covariance.cpp
++++ b/tests/test_covariance.cpp
+@@ -0,0 +1,96 @@
++#include "ekf9.hpp"
++#include "measurement.hpp"
++#include "small_matrix.hpp"
++#include <cmath>
++#include <iostream>
++#include <limits>
++#include <random>
++#include <stdexcept>
++using namespace rmv;
++namespace {
++int failures=0;
++void check(bool ok,const char* name) {if(!ok){std::cerr<<"FAIL "<<name<<'\n';++failures;}}
++void testCrossTermsAndBatch() {
++    PlateGeometry g;VehicleEkf e(g);auto c=diagonalCovariance(.01,.01,.01,.01);c[1]=c[4]=.004;
++    e.initFromMeasurement({1,0,.2},0,0,0,c.data());
++    check(std::abs(e.cov(VehicleEkf::CX,VehicleEkf::CY)-.004)<1e-12,"full initial xy covariance");
++    auto before=e.state();auto bad=c;bad[0]=-1;double z[4]={1,0,.2,0};
++    check(!e.update(0,z,4,bad.data())&&e.state().cx==before.cx,"reject invalid R without mutation");
++    z[0]=std::numeric_limits<double>::quiet_NaN();check(!e.update(0,z,4,c.data()),"reject NaN");
++    VehicleEkf shared(g),independent(g);shared.initFromMeasurement({1,0,.2},0,0,0);independent.initFromMeasurement({1,0,.2},0,0,0);
++    std::vector<PlateObservation> obs;
++    for(int j:{0,2}) {Measurement m;m.p_w=plateWorldPosition(shared.state(),j,g);m.theta=plateThetaMeas(shared.state(),j,g);
++        m.covariance=diagonalCovariance(1e-5,1e-5,1e-5,1e-5);m.shared_noise[6]=.10;obs.push_back({j,m});}
++    check(shared.updateBatch(obs),"joint correlated update");
++    for(auto& o:obs) {o.measurement.covariance=o.measurement.totalCovariance();o.measurement.shared_noise.fill(0);}
++    check(independent.updateBatch(obs),"joint independent update");
++    check(shared.cov(VehicleEkf::ZA,VehicleEkf::ZA)>independent.cov(VehicleEkf::ZA,VehicleEkf::ZA)*1.1,
++          "shared noise is not counted twice as independent evidence");
++    check(shared.covarianceHealthy()&&independent.covarianceHealthy(),"posterior SPD");
++    VehicleEkf pos(g,false);pos.initFromMeasurement({1,0,.2},0,0,0,c.data());
++    const double p[3]={1,0,.2};check(pos.update(0,p,3,c.data())&&pos.covarianceHealthy(),"3D observation stride");
++}
++void testUnequalGeometry() {
++    PlateGeometry g;VehicleEkf e(g);EkfState truth;truth.cx=1.8;truth.cy=.1;truth.za=.2;
++    truth.r=.225;truth.dr=.035;truth.dh=.045;
++    auto c=diagonalCovariance(1e-5,1e-5,1e-5,deg2rad(.3)*deg2rad(.3));
++    e.initFromMeasurement(plateWorldPosition(truth,0,g),0,0,0,c.data());
++    for(int k=1;k<=300;++k) {
++        truth.theta=wrapAngle(-1.3*k*.04);e.predict(.04);
++        std::vector<PlateObservation> obs;
++        for(int j=0;j<4;++j) {Measurement m;m.p_w=plateWorldPosition(truth,j,g);m.theta=plateThetaMeas(truth,j,g);m.covariance=c;obs.push_back({j,m});}
++        check(e.updateBatch(obs),"unequal geometry update");
++    }
++    auto s=e.state();check(std::abs(s.r-truth.r)<.003&&std::abs(s.dr-truth.dr)<.003&&std::abs(s.dh-truth.dh)<.003,
++                           "two radii and heights recover from wrong prior");
++    // Finite differences check every Jacobian column for all four slots.
++    double EkfState::* fields[VehicleEkf::N]={&EkfState::cx,&EkfState::vx,&EkfState::cy,&EkfState::vy,
++        &EkfState::za,&EkfState::vz,&EkfState::theta,&EkfState::omega,&EkfState::r,&EkfState::dr,&EkfState::dh};
++    for(int plate=0;plate<4;++plate) {
++        double h[4],H[4*VehicleEkf::N];int d;e.observe(plate,h,H,d);
++        for(int col=0;col<VehicleEkf::N;++col) {
++            auto plus=s,minus=s;plus.*fields[col]+=1e-6;minus.*fields[col]-=1e-6;
++            auto p=plateWorldPosition(plus,plate,g),m=plateWorldPosition(minus,plate,g);
++            double derivative[4]={(p.x-m.x)/2e-6,(p.y-m.y)/2e-6,(p.z-m.z)/2e-6,
++                wrapAngle(plateThetaMeas(plus,plate,g)-plateThetaMeas(minus,plate,g))/2e-6};
++            for(int row=0;row<4;++row) check(std::abs(derivative[row]-H[row*VehicleEkf::N+col])<1e-6,
++                                            "full observation Jacobian finite differences");
++        }
++    }
++}
++void testConsistency() {
++    std::mt19937 random(431);std::normal_distribution<double> normal(0,1);
++    double nis_sum=0,nis_dof=0,nees_sum=0;int accepted=0,finals=0;
++    constexpr int trials=40,steps=180;
++    for(int trial=0;trial<trials;++trial) {
++        PlateGeometry g;VehicleEkf e(g);EkfState truth;
++        truth.cx=2;truth.cy=.3;truth.za=.25;truth.theta=.2;truth.r=.22;truth.dr=.025;truth.dh=.035;
++        truth.vx=.1;truth.vy=-.05;truth.omega=-1.4;
++        auto c=diagonalCovariance(.005*.005,.005*.005,.005*.005,deg2rad(1)*deg2rad(1));
++        auto measurement=[&](int j) {Measurement m;m.p_w=plateWorldPosition(truth,j,g);m.theta=plateThetaMeas(truth,j,g);m.covariance=c;
++            m.p_w.x+=.005*normal(random);m.p_w.y+=.005*normal(random);m.p_w.z+=.005*normal(random);m.theta+=deg2rad(1)*normal(random);return m;};
++        auto first=measurement(0);e.initFromMeasurement(first.p_w,first.theta,0,0,c.data());
++        for(int k=1;k<=steps;++k) {
++            constexpr double dt=.04;double a[4]={.4*normal(random),.4*normal(random),.15*normal(random),.8*normal(random)};
++            truth.cx+=truth.vx*dt+.5*a[0]*dt*dt;truth.vx+=a[0]*dt;
++            truth.cy+=truth.vy*dt+.5*a[1]*dt*dt;truth.vy+=a[1]*dt;
++            truth.za+=truth.vz*dt+.5*a[2]*dt*dt;truth.vz+=a[2]*dt;
++            truth.theta=wrapAngle(truth.theta+truth.omega*dt+.5*a[3]*dt*dt);truth.omega+=a[3]*dt;
++            e.predict(dt,.4,.8,.15);std::vector<PlateObservation> obs;
++            for(int j=0;j<4;++j) obs.push_back({j,measurement(j)});
++            bool ok=e.updateBatch(obs);check(e.covarianceHealthy(),"Monte Carlo SPD");
++            if(k>30) {nis_sum+=e.lastNis();nis_dof+=e.lastDof();accepted+=ok;}
++        }
++        const auto& s=e.state();const double error[VehicleEkf::N]={s.cx-truth.cx,s.vx-truth.vx,s.cy-truth.cy,s.vy-truth.vy,s.za-truth.za,s.vz-truth.vz,
++            wrapAngle(s.theta-truth.theta),s.omega-truth.omega,s.r-truth.r,s.dr-truth.dr,s.dh-truth.dh};
++        double p[VehicleEkf::N*VehicleEkf::N],inv[VehicleEkf::N*VehicleEkf::N];
++        for(int i=0;i<VehicleEkf::N;++i) for(int j=0;j<VehicleEkf::N;++j) p[i*VehicleEkf::N+j]=e.cov(i,j);
++        if(small::inverseSpd(p,VehicleEkf::N,inv)) {for(int i=0;i<VehicleEkf::N;++i) for(int j=0;j<VehicleEkf::N;++j) nees_sum+=error[i]*inv[i*VehicleEkf::N+j]*error[j];++finals;}
++    }
++    double ratio=nis_sum/nis_dof,nees=nees_sum/finals;
++    std::cout<<"Monte Carlo: NIS/dof="<<ratio<<" final mean NEES="<<nees<<" (11 states), accepted="<<accepted<<'\n';
++    check(ratio>.8&&ratio<1.2,"innovation consistency under stated noise model");
++    check(finals==trials&&nees>5&&nees<17,"independent-trial NEES bounds");
++}
++}
++int main() {testCrossTermsAndBatch();testUnequalGeometry();testConsistency();return failures?1:0;}
+--- a/tests/test_ekf_synth.cpp
++++ b/tests/test_ekf_synth.cpp
+@@ -209,10 +209,10 @@
+     const bool id_ok = id_diag.n_matched == 0 && id_diag.has_prediction;
+ 
+     const double z[4] = {0.9, 0.0, 0.2, 0.0};
+-    const double low_r[4] = {0.0001, 0.0001, 0.0001, 0.0001};
+-    const double high_r[4] = {1.0, 1.0, 1.0, 1.0};
+-    const bool noise_ok = id_tracker.ekf().mahalanobis(0, z, 4, high_r)
+-                        < id_tracker.ekf().mahalanobis(0, z, 4, low_r);
++    const auto low_r = diagonalCovariance(.0001,.0001,.0001,.0001);
++    const auto high_r = diagonalCovariance(1,1,1,1);
++    const bool noise_ok = id_tracker.ekf().mahalanobis(0, z, 4, high_r.data())
++                        < id_tracker.ekf().mahalanobis(0, z, 4, low_r.data());
+     std::printf("目标类别门控: %s; 量测协方差权重: %s\n",
+                 id_ok ? "PASS" : "FAIL", noise_ok ? "PASS" : "FAIL");
+ 
+--- a/tests/test_pose.cpp
++++ b/tests/test_pose.cpp
+@@ -0,0 +1,56 @@
++#include "pose_estimator.hpp"
++#include "measurement.hpp"
++#include "state_visualizer.hpp"
++#include "w3_config_loader.hpp"
++#include "small_matrix.hpp"
++#include <opencv2/opencv.hpp>
++#include <filesystem>
++#include <fstream>
++#include <iostream>
++#include <random>
++using namespace rmv;
++int main() {
++    int errors=0;auto check=[&](bool b,const char* n){if(!b){std::cerr<<"FAIL "<<n<<'\n';++errors;}};
++    W3Config cfg;cfg.corner_sigma_px=.5;cfg.position_noise_floor_m=1e-6;cfg.yaw_noise_floor_deg=1e-4;cfg.imu_attitude_sigma_deg=0;
++    CameraParams cam;cam.camera_matrix=cv::Mat(3,3,CV_64F,cfg.K).clone();cam.dist_coeffs=cv::Mat(1,5,CV_64F,cfg.D).clone();
++    const std::string file="pose_test_imu.txt";{std::ofstream f(file);f<<"0 1 0 0 0\n1 1 0 0 0\n";}
++    ImuSeries imu;check(imu.load(file),"pose IMU");WorldFrame wf(&imu,&cfg);PoseEstimator estimator(cam,cfg);PnpSolver raw(cam);
++    const double t=.5,yaw=.35;const Vec3 pcam(.04,-.03,2.0),world=wf.cam_to_world(t,pcam);
++    auto Rw=plateRotationWorld(yaw,deg2rad(-15));Mat3 Rc=wf.R_world_to_cam(t)*Rw;
++    cv::Mat R(3,3,CV_64F);for(int i=0;i<3;++i) for(int j=0;j<3;++j) R.at<double>(i,j)=Rc.m[i][j];
++    cv::Mat rv;cv::Rodrigues(R,rv);std::vector<cv::Point3d> obj{{-.0675,-.0275,0},{.0675,-.0275,0},{.0675,.0275,0},{-.0675,.0275,0}};
++    std::vector<cv::Point2d> projected;cv::projectPoints(obj,rv,cv::Vec3d(pcam.x,pcam.y,pcam.z),cam.camera_matrix,cam.dist_coeffs,projected);
++    Armor armor;for(auto p:projected) armor.corners.emplace_back(p);auto candidates=raw.solveCandidates(armor);
++    check(candidates.size()==2,"IPPE both candidates retained");auto result=estimator.estimate(armor,t,wf);
++    check(result.ok,"constrained solve");
++    if(result.ok) {
++        check((result.measurement.p_w-world).norm()<1e-4,"exact synthetic position");
++        check(std::abs(wrapAngle(result.measurement.theta-yaw))<1e-4,"exact synthetic yaw and pitch prior");
++        double inv[16];check(small::inverseSpd(result.measurement.covariance.data(),4,inv),"full pose covariance SPD");
++        check(std::abs(result.measurement.covariance[3])>1e-10,"position/yaw correlation retained");
++    }
++    // Regression: uncalibrated camera/IMU roll in the real clip is a few degrees.
++    // A hard pitch/upright constraint rejected most frames; soft priors must tolerate it.
++    cv::Mat roll_vector=(cv::Mat_<double>(3,1)<<.07,0,0),roll_rotation;
++    cv::Rodrigues(roll_vector,roll_rotation);cv::Mat tilted=roll_rotation*R,tilted_r;
++    cv::Rodrigues(tilted,tilted_r);std::vector<cv::Point2d> tilted_pixels;
++    cv::projectPoints(obj,tilted_r,cv::Vec3d(pcam.x,pcam.y,pcam.z),cam.camera_matrix,cam.dist_coeffs,tilted_pixels);
++    Armor tilted_armor;for(auto p:tilted_pixels) tilted_armor.corners.emplace_back(p);
++    auto tilted_result=estimator.estimate(tilted_armor,t,wf);
++    check(tilted_result.ok&&tilted_result.pose.rms_px<1,"soft installation prior tolerates residual roll");
++    std::mt19937 rng(17);std::normal_distribution<double> noise(0,.5);double nees=0;int count=0;
++    for(int k=0;k<100;++k) {
++        Armor noisy=armor;for(auto& p:noisy.corners){p.x+=noise(rng);p.y+=noise(rng);}
++        auto fit=estimator.estimate(noisy,t,wf);if(!fit.ok) continue;
++        auto& m=fit.measurement;double e[4]={m.p_w.x-world.x,m.p_w.y-world.y,m.p_w.z-world.z,wrapAngle(m.theta-yaw)},inv[16];
++        if(!small::inverseSpd(m.covariance.data(),4,inv)) continue;
++        for(int i=0;i<4;++i) for(int j=0;j<4;++j) nees+=e[i]*inv[i*4+j]*e[j];++count;
++    }
++    std::cout<<"Pixel-noise Monte Carlo: valid="<<count<<" mean pose NEES="<<nees/count<<" (4 DoF)\n";
++    check(count==100&&nees/count>1&&nees/count<7,"pixel Jacobian uncertainty propagation");
++    // A bad YAML matrix must not silently fall back to built-in calibration values.
++    const std::string yaml="invalid_pose_config.yaml";
++    {cv::FileStorage f(yaml,cv::FileStorage::WRITE);f<<"camera_matrix"<<cv::Mat::eye(2,2,CV_64F)<<"dist_coeffs"<<cv::Mat::zeros(1,5,CV_64F);}
++    W3Config invalid;check(!loadW3Config(yaml,invalid),"reject malformed calibration shape");
++    std::filesystem::remove(file);std::filesystem::remove(yaml);return errors?1:0;
++}
+--- a/tests/test_world_frame.cpp
++++ b/tests/test_world_frame.cpp
+@@ -1,175 +1,36 @@
+-//  世界系与投影自检(不依赖 OpenCV)
+-//
+-//  检查:
+-//    1. R_cam_to_world 是正交阵;
+-//    2. 世界点 -> 相机 -> 世界 往返一致;
+-//    3. 像素 -> 归一化坐标 与 世界点投影 的射线方向一致(投影/反投影互逆);
+-//    4. 重力对齐:世界系 z 朝上,即相机 y 轴(图像向下)映到世界约为 (0,0,-1)。
+-//
+-//  编译(两条命令都已在本机跑通):
+-//      g++ -std=c++17 -O2 -Iinclude tests/test_world_frame.cpp src/imu_series.cpp src/world_frame.cpp -o build/test_world_frame
+-
+ #include "imu_series.hpp"
+-#include "math3d.hpp"
+-#include "w3_types.hpp"
+ #include "world_frame.hpp"
+-
+-#include <algorithm>
++#include "frame_timeline.hpp"
++#include <filesystem>
++#include <fstream>
++#include <iomanip>
++#include <iostream>
+ #include <cmath>
+-#include <cstdio>
+-#include <fstream>
+-
+ using namespace rmv;
+-
+-namespace
+-{
+-
+-int g_fail = 0;
+-
+-void check(bool cond, const char* what)
+-{
+-    if (!cond)
+-    {
+-        std::printf("[FAIL] %s\n", what);
+-        ++g_fail;
+-    }
++int main() {
++    int errors=0;auto check=[&](bool b,const char* n){if(!b){std::cerr<<"FAIL "<<n<<'\n';++errors;}};
++    const std::string file="dynamic_test_imu.txt",frames="dynamic_frame_times.csv";
++    {std::ofstream f(file);f<<std::setprecision(17);
++     for(int i=0;i<=10;++i) {double t=i*.1,angle=2*t;
++         // Alternate quaternion signs: interpolation must still use the shortest arc.
++         double sign=i%2?-1:1;f<<t<<' '<<sign*std::cos(angle/2)<<" 0 0 "<<sign*std::sin(angle/2)<<'\n';}}
++    ImuSeries imu;check(imu.load(file),"load dynamic IMU");W3Config cfg;
++    cfg.t_ic[0]=.1;cfg.t_ic[1]=-.2;cfg.t_ic[2]=.3;WorldFrame wf(&imu,&cfg);
++    double t=.359,query=t-.009,expected=2*query;auto q=imu.quatAt(t,-.009);auto r=q.toMat3();
++    check(std::abs(std::atan2(r.m[1][0],r.m[0][0])-expected)<1e-10,"9ms sign and SLERP at non-sample time");
++    Vec3 p(.3,-.2,4),w=wf.cam_to_world(t,p),back=wf.world_to_cam(t,w);
++    check((p-back).norm()<1e-10,"nonidentity rotation + lever-arm inverse");
++    Vec3 origin=wf.cam_to_world(t,{}),want=r*Vec3(.1,-.2,.3);
++    check((origin-want).norm()<1e-10,"lever arm rotates with IMU");
++    auto pixel=wf.project(t,w);auto ray=wf.undistortToNormalized(pixel);
++    check(std::hypot(ray.x-p.x/p.z,ray.y-p.y/p.z)<1e-7,"distortion round trip");
++    {std::ofstream f(file);f<<"0 1 0 0 0\n0 1 0 0 0\n";}check(!imu.load(file),"reject duplicate IMU time");
++    {std::ofstream f(file);f<<"0 1 0 0 0\n1 0 0 0 0\n";}check(!imu.load(file),"reject zero quaternion");
++    {std::ofstream f(file);f<<"0 1 0 0 0\nbad row\n1 1 0 0 0\n";}check(!imu.load(file),"do not skip corrupt index rows");
++    {std::ofstream f(frames);f<<"frame,t_image_s\n0,0.520\n1,0.562\n2,0.603\n";}
++    auto ts=loadFrameTimes(frames);check(ts.size()==3&&std::abs(ts[1]-.562)<1e-12,"explicit frame timestamp input");
++    {std::ofstream f(frames);f<<"frame,t_image_s\n0,1\n2,2\n";}
++    bool rejected=false;try{loadFrameTimes(frames);}catch(const std::exception&){rejected=true;}check(rejected,"reject missing frame index");
++    std::filesystem::remove(file);std::filesystem::remove(frames);
++    std::cout<<"Dynamic rotation, interpolation, time-offset and timestamp validation: "<<(errors?"FAIL":"PASS")<<'\n';return errors?1:0;
+ }
+-
+-//  写一份"单位姿态"的假 IMU,让测试不依赖真实数据也能跑
+-bool writeFakeImu(const char* path, int n = 50)
+-{
+-    std::ofstream ofs(path);
+-    if (!ofs.is_open()) return false;
+-    for (int i = 0; i < n; ++i)
+-        ofs << (i * 0.0415) << " 1 0 0 0\n";     //  四元数字段顺序: w x y z
+-    return true;
+-}
+-
+-}   //  namespace
+-
+-int main(int argc, char** argv)
+-{
+-    W3Config cfg;
+-
+-    const char* fake = "_fake_imu.txt";
+-    const bool fake_ok = writeFakeImu(fake);
+-    check(fake_ok, "写假 IMU 文件");
+-
+-    ImuSeries imu;
+-    const bool loaded = imu.load(fake);
+-    check(loaded, "读 IMU 文件");
+-    if (!loaded) return 1;
+-
+-    WorldFrame wf(&imu, &cfg);
+-
+-    //  ---- 1. 正交性 + 行列式 ----
+-    for (double t = 0.0; t < 1.9; t += 0.13)
+-    {
+-        const Mat3 R = wf.R_cam_to_world(t);
+-        const Mat3 RtR = R.transposed() * R;
+-        for (int i = 0; i < 3; ++i)
+-            for (int j = 0; j < 3; ++j)
+-            {
+-                const double expect = (i == j) ? 1.0 : 0.0;
+-                check(std::fabs(RtR.m[i][j] - expect) < 1e-9, "R 正交");
+-            }
+-
+-        const double det = R.m[0][0] * (R.m[1][1] * R.m[2][2] - R.m[1][2] * R.m[2][1]) -
+-                           R.m[0][1] * (R.m[1][0] * R.m[2][2] - R.m[1][2] * R.m[2][0]) +
+-                           R.m[0][2] * (R.m[1][0] * R.m[2][1] - R.m[1][1] * R.m[2][0]);
+-        check(std::fabs(det - 1.0) < 1e-9, "det(R)=+1");
+-    }
+-
+-    //  ---- 2. 往返一致 ----
+-    {
+-        const double t = 0.7;
+-        const Vec3 p_cam(0.3, -0.2, 4.0);
+-        const Vec3 p_w = wf.cam_to_world(t, p_cam);
+-        const Vec3 back = wf.world_to_cam(t, p_w);
+-        check((back - p_cam).norm() < 1e-9, "相机->世界->相机 往返");
+-    }
+-    {
+-        W3Config shifted = cfg;
+-        shifted.t_ic[0] = 0.1;
+-        shifted.t_ic[1] = -0.2;
+-        shifted.t_ic[2] = 0.3;
+-        WorldFrame shifted_wf(&imu, &shifted);
+-        const Vec3 origin = shifted_wf.cam_to_world(0.7, Vec3());
+-        check((origin - Vec3(0.1, -0.2, 0.3)).norm() < 1e-9,
+-              "相机安装平移映射");
+-        check(shifted_wf.world_to_cam(0.7, origin).norm() < 1e-9,
+-              "含安装平移的往返");
+-    }
+-
+-    //  ---- 3. 投影与反投影互逆(归一化平面方向一致) ----
+-    {
+-        const double t = 0.42;
+-        const Vec3 p_cam(0.25, -0.15, 3.5);
+-        const Vec3 p_w = wf.cam_to_world(t, p_cam);
+-        const Vec2 uv = wf.project(t, p_w);
+-
+-        //  像素有畸变,反解回归一化坐标并还原成射线方向
+-        const Vec2 xn = wf.undistortToNormalized(uv);
+-        const Vec3 ray(xn.x, xn.y, 1.0);
+-        const Vec3 dir1 = ray.normalized();
+-        const Vec3 dir2 = (p_cam / p_cam.norm());
+-        check((dir1 - dir2).norm() < 1e-6, "投影/反投影射线一致");
+-
+-        //  像素坐标应落在图像范围内
+-        check(uv.x > -50.0 && uv.x < 1490.0 && uv.y > -50.0 && uv.y < 1130.0,
+-              "像素落在图像附近");
+-    }
+-
+-    //  ---- 4. 重力对齐:相机 y 轴(向下) -> 世界 (0,0,-1) ----
+-    {
+-        const Mat3 R = wf.R_cam_to_world(0.0);      //  假 IMU 是单位姿态
+-        const Vec3 cam_y_in_world = R.col(1);
+-        const Vec3 down(0.0, 0.0, -1.0);
+-        const double cosang = cam_y_in_world.dot(down);
+-        const double deg = rad2deg(std::acos(std::min(1.0, std::max(-1.0, cosang))));
+-        std::printf("相机 y 轴在世界系: (%+.3f, %+.3f, %+.3f),偏离 -z %.2f deg\n",
+-                    cam_y_in_world.x, cam_y_in_world.y, cam_y_in_world.z, deg);
+-        check(deg < 1e-6, "单位姿态下相机 y 轴 = 世界 -z");
+-
+-        //  相机 z 轴(前) -> 世界 +x
+-        const Vec3 cam_z_in_world = R.col(2);
+-        std::printf("相机 z 轴在世界系: (%+.3f, %+.3f, %+.3f)\n",
+-                    cam_z_in_world.x, cam_z_in_world.y, cam_z_in_world.z);
+-        check(cam_z_in_world.x > 0.999, "相机 z 轴 = 世界 +x");
+-    }
+-
+-
+-    //  ---- 5. 真实数据(可选):传入 imu.txt 就检查重力方向 ----
+-    if (argc > 1)
+-    {
+-        ImuSeries real;
+-        if (!real.load(argv[1]))
+-        {
+-            std::printf("读不到 %s,跳过真实数据检查\n", argv[1]);
+-        }
+-        else
+-        {
+-            WorldFrame wfr(&real, &cfg);
+-            Vec3 sum;
+-            int cnt = 0;
+-            //  每 5 条取一个,统计相机 y 轴(图像向下)在世界系里的平均方向
+-            for (std::size_t i = 0; i < real.size(); i += 5)
+-            {
+-                const Mat3 R = wfr.R_cam_to_world(real.timeAt((int)i));
+-                sum += R.col(1);
+-                ++cnt;
+-            }
+-            const Vec3 mean = (sum / (double)cnt).normalized();
+-            const double deg = rad2deg(std::acos(std::min(
+-                1.0, std::max(-1.0, mean.dot(Vec3(0.0, 0.0, -1.0))))));
+-            std::printf("真实数据 %zu 条: 相机 y 轴平均 = (%+.3f, %+.3f, %+.3f),"
+-                        "偏离世界 -z %.2f deg\n",
+-                        real.size(), mean.x, mean.y, mean.z, deg);
+-            check(deg < 10.0, "真实数据:世界系接近重力对齐");
+-            std::printf("平均采样率 %.3f Hz\n", real.meanRate());
+-        }
+-    }
+-    if (g_fail == 0)
+-        std::printf("\n世界系/投影自检通过\n");
+-    return g_fail == 0 ? 0 : 1;
+-}
+--- a/tools/analyze_tracking.py
++++ b/tools/analyze_tracking.py
+@@ -1,70 +1,58 @@
+-"""Summarize tracking and pre-update geometric residuals from one or more CSV files."""
+-
++"""Summarize frame coverage and model residuals; no ground-truth accuracy is implied."""
+ import argparse
+ import csv
+ import math
+ import statistics
+-from collections import defaultdict
+ from pathlib import Path
+ 
+-
+-def finite_values(rows, field):
+-    values = []
++def finite(rows, field):
++    result = []
+     for row in rows:
+         try:
+-            value = float(row[field])
+-        except (TypeError, ValueError):
++            value = float(row.get(field, 'nan'))
++        except (ValueError, TypeError):
+             continue
+         if math.isfinite(value):
+-            values.append(value)
+-    return values
+-
++            result.append(value)
++    return result
+ 
+ def summarize(path, warmup):
+-    with path.open(newline="", encoding="utf-8") as stream:
++    with path.open(encoding='utf-8', newline='') as stream:
+         rows = list(csv.DictReader(stream))
+     if not rows:
+-        raise ValueError(f"empty CSV: {path}")
+-    required = {"frame", "t", "matched_j", "n_matched", "reinit", "r",
+-                "pre_reproj_rms_px", "pre_z_residual_m"}
+-    if not required.issubset(rows[0]):
+-        raise ValueError(f"missing diagnostic columns: {path}")
+-
+-    settled = [row for row in rows if int(row["frame"]) >= warmup]
+-    matched = [row for row in settled if int(row["n_matched"]) > 0]
+-    reproj = finite_values(matched, "pre_reproj_rms_px")
+-    radius_window = [row for row in rows if float(row["t"]) >= float(rows[-1]["t"]) - 5.0]
+-    radius = finite_values(radius_window, "r")
+-    reproj_median = f"{statistics.median(reproj):.2f}" if reproj else "n/a"
+-    reproj_p90 = f"{sorted(reproj)[int(0.9 * (len(reproj)-1))]:.2f}" if reproj else "n/a"
+-    radius_median = f"{statistics.median(radius):.4f}" if radius else "n/a"
+-    radius_span = f"{max(radius)-min(radius):.4f}" if radius else "n/a"
+-    print(f"{path}: frames={len(rows)} matched={len(matched)}/{len(settled)} "
+-          f"reinit={sum(int(row['reinit']) > 0 for row in rows)} "
+-          f"reproj_median_px={reproj_median} "
+-          f"reproj_p90_px={reproj_p90} "
+-          f"radius_last5s_m={radius_median} "
+-          f"radius_span_last5s_m={radius_span}")
+-
+-    by_plate = defaultdict(list)
+-    for row in matched:
+-        value = float(row["pre_z_residual_m"])
+-        if math.isfinite(value):
+-            by_plate[int(row["matched_j"])].append(value)
+-    for plate in sorted(by_plate):
+-        values = by_plate[plate]
+-        print(f"  plate={plate} n={len(values)} "
+-              f"z_residual_median_m={statistics.median(values):+.4f}")
+-
++        raise ValueError(f'Empty CSV: {path}')
++    settled = [r for r in rows if int(r['frame']) >= warmup]
++    matched = [r for r in settled if int(r['n_matched']) > 0]
++    initialized = sum(int(r.get('initialization', r['reinit'])) > 0 for r in rows)
++    reinitializations = sum(int(r['reinit']) > 0 for r in rows) if 'initialization' in rows[0] else max(0, initialized-1)
++    print(f'{path}: frames={len(rows)}, matched after warmup={len(matched)}/{len(settled)}, '
++          f'initializations={initialized}, reinitializations={reinitializations}')
++    for name in ('pre_reproj_rms_px', 'pre_reproj_all_rms_px', 'post_reproj_all_rms_px'):
++        values = sorted(finite(matched, name))
++        if values:
++            print(f'  {name}: median={statistics.median(values):.3f} p90={values[int(.9*(len(values)-1))]:.3f}')
++    tail = [r for r in rows if float(r['t']) >= float(rows[-1]['t'])-5]
++    for name in ('r', 'dr', 'dh'):
++        values = finite(tail, name)
++        if values:
++            print(f'  last5s {name}: median={statistics.median(values):.5f} range={max(values)-min(values):.5f} m')
++    if 'covariance_ok' in rows[0]:
++        valid = [r for r in rows if finite([r], 'cx')]
++        print(f"  covariance SPD={sum(int(r['covariance_ok']) for r in valid)}/{len(valid)}, "
++              f"IMU boundary holds={sum(int(r['imu_clamped']) for r in rows)}")
++    normalized = [float(r['nis'])/int(r['nis_dof']) for r in matched
++                  if int(r.get('nis_dof', 0)) > 0 and finite([r], 'nis')]
++    if normalized:
++        print(f'  accepted-update mean NIS/dof={statistics.mean(normalized):.3f} '
++              '(selected/gated sample; not an unbiased calibration test)')
+ 
+ def main():
+     parser = argparse.ArgumentParser(description=__doc__)
+-    parser.add_argument("csv", type=Path, nargs="+")
+-    parser.add_argument("--warmup-frames", type=int, default=30)
++    parser.add_argument('csv', nargs='+', type=Path)
++    parser.add_argument('--warmup-frames', type=int, default=30)
+     args = parser.parse_args()
+     for path in args.csv:
+         summarize(path, args.warmup_frames)
+ 
+-
+-if __name__ == "__main__":
++if __name__ == '__main__':
+     main()
+--- a/tools/check_cli.py
++++ b/tools/check_cli.py
+@@ -0,0 +1,56 @@
++"""Integration checks for timestamp sources, bounds and cached/raw detector equivalence."""
++import csv
++import json
++import subprocess
++import tempfile
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++APP = ROOT / 'build/rm_week3'
++CACHE = ROOT / 'results/revision/nn_detections.cache'
++
++def run(*args, ok=True):
++    result = subprocess.run([str(APP), *map(str, args)], cwd=ROOT, text=True,
++                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60)
++    if (result.returncode == 0) != ok:
++        raise AssertionError(result.stdout)
++    return result.stdout
++
++def rows(path):
++    with path.open(newline='') as stream:
++        return list(csv.DictReader(stream))
++
++def main():
++    if not CACHE.exists():
++        raise SystemExit('Generate the complete NN detection cache before integration checks')
++    with tempfile.TemporaryDirectory(prefix='rm-week3-cli-') as directory:
++        temp = Path(directory)
++        run('--no-video', '--plate-radius', '.5', ok=False)
++        run('--no-video', '--imu-offset', 'nan', ok=False)
++        run('--time-mode', 'unknown', ok=False)
++        run('--time-mode', 'video', ok=False)
++        raw, cached = temp / 'raw.csv', temp / 'cached.csv'
++        run('--no-video', '--max-frames', 8, '--csv', raw)
++        run('--no-video', '--max-frames', 8, '--detection-cache', CACHE, '--csv', cached)
++        a, b = rows(raw), rows(cached)
++        for ra, rb in zip(a, b):
++            for key in ('cx', 'cy', 'za', 'theta', 'omega', 'r', 'dr', 'dh'):
++                if abs(float(ra[key])-float(rb[key])) > 1e-6:
++                    raise AssertionError(f'Cache changed estimates: {key}')
++        imu_times = [float(line.split()[0]) for line in (ROOT/'data/imu.txt').read_text().splitlines() if line.strip()]
++        timestamps = temp/'times.csv'
++        # Synthetic integration fixture, not a claim about the recording's real capture times.
++        timestamps.write_text('frame,t_image_s\n'+''.join(f'{i},{t+.009:.12f}\n' for i,t in enumerate(imu_times)))
++        explicit = temp/'explicit.csv'
++        run('--no-video', '--frame-times', timestamps, '--max-frames', 8,
++            '--detection-cache', CACHE, '--csv', explicit)
++        meta = json.loads(Path(str(explicit)+'.meta.json').read_text())
++        assert meta['time_mode'] == 'timestamps' and meta['imu_clamped_frames'] == 0
++        assert meta['time_correspondence_verified'] == 0
++        timestamps.write_text('frame,t_image_s\n'+''.join(f'{i},{t-1:.12f}\n' for i,t in enumerate(imu_times)))
++        run('--no-video', '--frame-times', timestamps, '--max-frames', 8,
++            '--detection-cache', CACHE, '--csv', temp/'outside.csv', ok=False)
++    print('PASS: strict CLI, mechanical bounds, explicit timestamps, IMU coverage, cached/raw equivalence')
++
++if __name__ == '__main__':
++    main()
+--- a/tools/compare_runs.py
++++ b/tools/compare_runs.py
+@@ -0,0 +1,60 @@
++"""Create a comparison on identical frames, and check objective regression gates."""
++import argparse
++import csv
++import json
++import math
++import statistics
++from pathlib import Path
++
++def read(path):
++    with path.open(encoding='utf-8', newline='') as stream:
++        return {int(r['frame']): r for r in csv.DictReader(stream)}
++
++def summary(values):
++    values = sorted(values)
++    return {'n': len(values), 'median': statistics.median(values),
++            'p90': values[int(.9*(len(values)-1))]}
++
++def main():
++    p = argparse.ArgumentParser(description=__doc__)
++    p.add_argument('baseline', type=Path)
++    p.add_argument('updated', type=Path)
++    p.add_argument('baseline_reprojection', type=Path)
++    p.add_argument('updated_reprojection', type=Path)
++    p.add_argument('--output', type=Path, required=True)
++    a = p.parse_args()
++    old, new = read(a.baseline), read(a.updated)
++    ro, rn = read(a.baseline_reprojection), read(a.updated_reprojection)
++    if set(old) != set(new) or set(ro) != set(rn) or set(new) != set(rn):
++        raise ValueError('Frame coverage differs; compare identical frames first')
++    evaluation = [f for f in sorted(new) if f >= 30]
++    for f in evaluation:
++        if ro[f]['n_detected'] != rn[f]['n_detected'] or ro[f]['n_evaluated'] != rn[f]['n_evaluated']:
++            raise ValueError('Raw detection evaluation coverage differs')
++    def finite(rows, field, frames):
++        return [float(rows[f][field]) for f in frames if math.isfinite(float(rows[f][field]))]
++    common_matched = [f for f in evaluation if int(old[f]['n_matched']) and int(new[f]['n_matched'])]
++    result = {'evaluated_frames': len(evaluation), 'common_matched_frames': len(common_matched)}
++    for name, states, reproj in [('baseline', old, ro), ('updated', new, rn)]:
++        result[name] = {'matched_frames': sum(int(states[f]['n_matched']) > 0 for f in evaluation),
++                        'pre_reprojection_matched': summary(finite(states, 'pre_reproj_rms_px', evaluation)),
++                        'pre_reprojection_common_frames': summary(finite(states, 'pre_reproj_rms_px', common_matched)),
++                        'all_detection_reprojection': summary(finite(reproj, 'rms_px', evaluation))}
++    old_med = result['baseline']['all_detection_reprojection']['median']
++    new_med = result['updated']['all_detection_reprojection']['median']
++    result['median_reduction_percent'] = 100*(old_med-new_med)/old_med
++    checks = {'all_frames_processed': len(new) == 531,
++              'no_pose_rejection': all(r['n_detected'] == r['n_meas'] for r in new.values()),
++              'covariance_positive_definite': all(int(r['covariance_ok']) for r in new.values()),
++              'no_reinitialization': not any(int(r['reinit']) for r in new.values()),
++              'matched_coverage_not_lower': result['updated']['matched_frames'] >= result['baseline']['matched_frames'],
++              'raw_reprojection_median_improved': new_med < old_med,
++              'raw_reprojection_p90_improved': result['updated']['all_detection_reprojection']['p90'] < result['baseline']['all_detection_reprojection']['p90']}
++    result['checks'] = checks
++    a.output.write_text(json.dumps(result, indent=2, ensure_ascii=False)+'\n', encoding='utf-8')
++    print(json.dumps(result, indent=2, ensure_ascii=False))
++    if not all(checks.values()):
++        raise SystemExit('At least one real-video regression gate failed')
++
++if __name__ == '__main__':
++    main()
+--- a/tools/evaluate_reprojection.cpp
++++ b/tools/evaluate_reprojection.cpp
+@@ -0,0 +1,56 @@
++#include "detection_cache.hpp"
++#include "camera.hpp"
++#include "imu_series.hpp"
++#include "measurement.hpp"
++#include "state_visualizer.hpp"
++#include "w3_config_loader.hpp"
++#include <algorithm>
++#include <cmath>
++#include <iostream>
++#include <map>
++#include <sstream>
++using namespace rmv;
++int main(int argc,char** argv) {
++    try {
++        if(argc<6) throw std::runtime_error("usage: evaluate_reprojection states.csv detections.cache camera.yaml imu.txt output.csv [pitch_override_deg]");
++        CameraParams cam;W3Config cfg;if(!loadCameraParams(argv[3],cam)||!loadW3Config(argv[3],cfg)) return 1;
++        if(argc>6) cfg.plate.inward_pitch_deg=std::stod(argv[6]);
++        ImuSeries imu;if(!imu.load(argv[4])) return 1;WorldFrame wf(&imu,&cfg);
++        std::ifstream cache_file(argv[2]);std::string signature;std::getline(cache_file,signature);
++        auto detections=readDetectionCache(argv[2],signature);
++        std::ifstream in(argv[1]);std::string line,field;std::getline(in,line);std::stringstream hs(line);
++        std::map<std::string,int> columns;int k=0;while(std::getline(hs,field,',')) columns[field]=k++;
++        std::ofstream out(argv[5]);if(!out) throw std::runtime_error("Cannot write evaluation CSV");
++        out<<"frame,n_detected,n_evaluated,rms_px\n";std::vector<double> errors;
++        while(std::getline(in,line)) {
++            std::stringstream row(line);std::vector<std::string> values;while(std::getline(row,field,',')) values.push_back(field);
++            auto get=[&](const char* name,double fallback=0.) {auto it=columns.find(name);return it==columns.end()?fallback:std::stod(values.at(it->second));};
++            int f=int(get("frame"));double t=get("t");if(f<0||f>=(int)detections.size()) throw std::runtime_error("State/cache frame mismatch");
++            EkfState s;s.cx=get("cx");s.cy=get("cy");s.za=get("za");s.theta=get("theta");s.r=get("r");s.dr=get("dr");s.dh=get("dh");
++            double sum=0;int count=0;
++            if(std::isfinite(s.cx)) for(const auto& a:detections[f]) {
++                double best=std::numeric_limits<double>::infinity();
++                for(int j=0;j<4;++j) {
++                    auto points=plateCornersWorld(s,j,cfg.plate,(a.size==ArmorSize::BIG?cam.big_width:cam.small_width)/1000.,(a.size==ArmorSize::BIG?cam.big_height:cam.small_height)/1000.);
++                    auto center=wf.world_to_cam(t,plateWorldPosition(s,j,cfg.plate));
++                    auto normal=wf.R_world_to_cam(t)*plateRotationWorld(s.theta+deg2rad(cfg.plate.phase_deg[j]),deg2rad(cfg.plate.inward_pitch_deg)).col(2);
++                    if(normal.dot(center)<=0) continue;
++                    double se=0;bool valid=true;
++                    for(int p=0;p<4;++p) {
++                        Vec3 v(points[p].x,points[p].y,points[p].z);if(wf.world_to_cam(t,v).z<=.05){valid=false;break;}
++                        auto uv=wf.project(t,v);se+=std::pow(uv.x-a.corners[p].x,2)+std::pow(uv.y-a.corners[p].y,2);
++                    }
++                    if(valid) best=std::min(best,se/4.);
++                }
++                if(std::isfinite(best)) {sum+=best;++count;}
++            }
++            double rms=count?std::sqrt(sum/count):std::numeric_limits<double>::quiet_NaN();
++            out<<f<<','<<detections[f].size()<<','<<count<<','<<rms<<'\n';
++            if(f>=30&&std::isfinite(rms)) errors.push_back(rms);
++        }
++        if(errors.empty()) throw std::runtime_error("No evaluable frames");std::sort(errors.begin(),errors.end());
++        std::cout<<"All raw detections, nearest front-facing predicted plate; no EKF gate selection. frames="<<errors.size()
++                 <<" median_px="<<errors[errors.size()/2]<<" p90_px="<<errors[size_t(.9*(errors.size()-1))]<<'\n';
++        return 0;
++    } catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}
++}
+--- a/tools/plot_states.py
++++ b/tools/plot_states.py
+@@ -1,89 +1,71 @@
+-"""把 rm_week3 输出的 states CSV 画成 9 条状态曲线(作业要求的那张图)。
+-
+-C++ 主程序只负责输出 CSV,画图用 matplotlib 更省事:
+-    python tools/plot_states.py results/states_week3.csv
+-默认输出 results/states_week3.png
+-"""
+-import sys
++"""Plot all available vehicle states with 2-sigma bands and reset boundaries."""
++import argparse
++from pathlib import Path
+ import numpy as np
+ import matplotlib
+-
+-matplotlib.use("Agg")
++matplotlib.use('Agg')
+ import matplotlib.pyplot as plt
+ 
+-#  中文字体: 先看系统里到底装没装, 而不是直接写 Windows 字体名。
+-#  WSL 默认没有雅黑/黑体, 直接指定会退回 DejaVu, 汉字全渲染成方块(已实测)。
+-from matplotlib import font_manager
+-
+-_CJK_CANDIDATES = ["Microsoft YaHei", "SimHei", "Noto Sans CJK SC",
+-                   "Source Han Sans SC", "WenQuanYi Zen Hei",
+-                   "WenQuanYi Micro Hei", "AR PL UMing CN"]
+-_installed = {f.name for f in font_manager.fontManager.ttflist}
+-_cjk = [n for n in _CJK_CANDIDATES if n in _installed]
+-USE_CN = bool(_cjk)
+-
+-plt.rcParams["font.sans-serif"] = (_cjk if USE_CN else ["DejaVu Sans"]) + ["DejaVu Sans"]
+-plt.rcParams["axes.unicode_minus"] = False
+-if not USE_CN:
+-    print("[plot] 未找到中文字体, 改用英文标签。需要中文请先:")
+-    print("       sudo apt install -y fonts-wqy-zenhei")
+-
+-FIELDS_CN = [
+-    ("cx", "车心 x [m]"), ("vx", "vx [m/s]"),
+-    ("cy", "车心 y [m]"), ("vy", "vy [m/s]"),
+-    ("za", "板基准高度 za [m]"), ("vz", "vz [m/s]"),
+-    ("theta", "自转角 θ [deg]"), ("omega", "角速度 ω [rad/s]"),
+-    ("r", "半径 r [m]"),
+-]
+-FIELDS_EN = [
+-    ("cx", "center x [m]"), ("vx", "vx [m/s]"),
+-    ("cy", "center y [m]"), ("vy", "vy [m/s]"),
+-    ("za", "plate base height za [m]"), ("vz", "vz [m/s]"),
+-    ("theta", "yaw theta [deg]"), ("omega", "omega [rad/s]"),
+-    ("r", "radius r [m]"),
+-]
+-FIELDS = FIELDS_CN if USE_CN else FIELDS_EN
+-
++FIELDS = [('cx', 'center x [m]'), ('vx', 'vx [m/s]'),
++          ('cy', 'center y [m]'), ('vy', 'vy [m/s]'),
++          ('za', 'base plate height [m]'), ('vz', 'vz [m/s]'),
++          ('theta', 'yaw [deg], unwrap per track'), ('omega', 'omega [rad/s]'),
++          ('r', 'even radius [m]'), ('dr', 'odd - even radius [m]'),
++          ('dh', 'odd - even height [m]')]
+ 
+ def main():
+-    path = sys.argv[1] if len(sys.argv) > 1 else "results/states_week3.csv"
+-    out = sys.argv[2] if len(sys.argv) > 2 else path.replace(".csv", ".png")
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('csv', type=Path)
++    parser.add_argument('output', type=Path, nargs='?')
++    args = parser.parse_args()
++    data = np.atleast_1d(np.genfromtxt(args.csv, delimiter=',', names=True))
++    fields = [(i, f, title) for i, (f, title) in enumerate(FIELDS) if f in data.dtype.names]
++    reset = np.zeros(len(data), dtype=bool)
++    for name in ('initialization', 'reinit'):
++        if name in data.dtype.names:
++            reset |= np.nan_to_num(data[name]) > 0
++    valid = np.isfinite(data['cx'])
++    reset |= valid & np.r_[True, ~valid[:-1]]
++    count = (len(fields) + 1) // 2
++    fig, axes = plt.subplots(count, 2, figsize=(13, 2.3 * count), sharex=True, squeeze=False)
++    for ax, (index, name, title) in zip(axes.flat, fields):
++        values = data[name].astype(float).copy()
++        if name == 'theta':
++            begin = None
++            for n in range(len(values) + 1):
++                boundary = n == len(values) or not np.isfinite(values[n]) or reset[n]
++                if boundary and begin is not None:
++                    values[begin:n] = np.degrees(np.unwrap(values[begin:n]))
++                    begin = None
++                if n < len(values) and np.isfinite(values[n]) and begin is None:
++                    begin = n
++        # Do not visually connect states across a lost track / new reference slot.
++        boundaries = reset.copy()
++        if len(boundaries):
++            boundaries[0] = False
++        values[boundaries] = np.nan
++        ax.plot(data['t'], values, linewidth=1, label='estimate')
++        covariance = f'P{index}'
++        if covariance in data.dtype.names:
++            sigma = np.sqrt(np.maximum(data[covariance], 0))
++            if name == 'theta':
++                sigma = np.degrees(sigma)
++            ax.fill_between(data['t'], values - 2*sigma, values + 2*sigma,
++                            color='tab:blue', alpha=.15, label='±2 sigma (model)')
++        for stamp in data['t'][boundaries]:
++            ax.axvline(stamp, color='tab:red', linewidth=.6, alpha=.5)
++        ax.set_ylabel(title, fontsize=9)
++        ax.grid(alpha=.25)
++    for ax in list(axes.flat)[len(fields):]:
++        ax.set_visible(False)
++    for ax in axes[-1]:
++        ax.set_xlabel('time [s]')
++    axes.flat[0].legend(fontsize=8)
++    fig.suptitle(f'{len(fields)}-state vehicle estimate; uncertainty is conditional on model assumptions')
++    fig.tight_layout()
++    output = args.output or args.csv.with_suffix('.png')
++    fig.savefig(output, dpi=140)
++    print(output)
+ 
+-    data = np.genfromtxt(path, delimiter=",", names=True, dtype=float)
+-    t = np.atleast_1d(data["t"])
+-
+-    fig, axes = plt.subplots(5, 2, figsize=(13, 12), sharex=True)
+-    axes = axes.ravel()
+-    for k, (name, label) in enumerate(FIELDS):
+-        ax = axes[k]
+-        if name not in data.dtype.names:
+-            ax.set_visible(False)
+-            continue
+-
+-        y = np.atleast_1d(data[name]).astype(float)
+-        if name == "theta":
+-            #  角度要先解缠绕,否则 ±180° 跳变会让曲线断成两截
+-            good = np.isfinite(y)
+-            y[good] = np.degrees(np.unwrap(y[good]))
+-            label += " (unwrap)"
+-
+-        ax.plot(t, y, lw=1.4, color="tab:blue")
+-        ax.set_ylabel(label, fontsize=9)
+-        ax.grid(alpha=0.3)
+-        ax.tick_params(labelsize=8)
+-
+-    #  5×2 共 10 格,9 个量占 0..8,只有最后一格(索引 9)是空的
+-    #  注意别写成 axes[8]: 那正好是 r 曲线所在的格子
+-    axes[9].set_visible(False)
+-    for ax in axes[8:]:
+-        ax.set_xlabel("时间 [s]" if USE_CN else "time [s]", fontsize=9)
+-
+-    fig.suptitle("9 维 EKF 状态曲线" if USE_CN else "9-state EKF state curves",
+-                 fontsize=13)
+-    fig.tight_layout()
+-    fig.savefig(out, dpi=130)
+-    print("[plot] saved ->", out)
+-
+-
+-if __name__ == "__main__":
++if __name__ == '__main__':
+     main()
+--- a/视觉第三周作业_姓名.md
++++ b/视觉第三周作业_姓名.md
+@@ -0,0 +1,129 @@
++# 视觉第三周作业：整车状态估计
++
++姓名：**提交前填写**。本文件为可复跑的报告草稿，提交信息见文末。
++
++## 1. 输入与输出
++
++沿用第二周 C++ 检测器、数字分类与角点契约：左上、右上、右下、左下。
++相机分辨率 1440×1080，使用题目给定的内参及五参数畸变；小板角点模型 135×55 mm，大板 225×55 mm，PnP 输出换算为米。
++55 mm 是灯条长度；角点位于灯条端点，不是装甲板外壳的上下边缘。
++
++最终视频：[四板重投影和实时状态](results/revision/submission_nn.avi)。
++全部 11 项状态及模型 ±2σ：[状态曲线](results/revision/submission_nn.png)。
++原始估计：[CSV](results/revision/submission_nn.csv)，运行条件：[元数据](results/revision/submission_nn.csv.meta.json)。
++
++## 2. 时间与坐标
++
++IMU 文本为 `t qw qx qy qz`。查询式为
++
++$$t_q=t_{image}-0.009\ \mathrm{s}.$$
++
++在相邻四元数间做最短弧 SLERP。AVI 的 30 fps 与 IMU 的 24.086 Hz 不同，当前采用“帧 i 取第 i 条 IMU 时间作为图像时间”的**待确认假设**。
++首帧缺少前 9 ms 的 IMU，只保持首条姿态，并在 CSV 中标记；其他越界报错。
++已经实现真实逐帧时间戳 CSV 入口，获得录制端数据后无需改动估计器。
++
++假定四元数是 IMU→world 主动旋转，相机为右/下/前，IMU 为前/左/上。使用
++
++$$p_W=R_{WI}(t_q)(R_{IC}p_C+t_{IC}).$$
++
++配置名 `R_ci` 保留原工程命名，实际意义是上式的 $R_{IC}$。
++当前旋转只有轴向重排，安装平移取零；均不是实测手眼标定。世界系原点假定不平移，不具备机器人自身的场地定位。
++板的内法线指向车心，$\theta$ 是其水平投影方位角；角度差统一折回 $[-\pi,\pi)$。
++
++## 3. 位姿量测与不确定性
++
++IPPE 保留两组候选，先检查四角正深度和内法线，再分别进行 LM 优化。
++普通装甲板使用内法线 pitch=-15°、滚转=0° 的安装先验，标准差均为 5°。
++优化同时考虑像素残差和安装先验，选择代价较小的候选；允许未标定外参与车体小幅倾斜，不硬性压成竖直板。
++
++用白化残差 Jacobian $J$ 近似参数协方差，再通过 $[p_W,\theta]$ 的 Jacobian 传播：
++
++$$\Sigma_\eta\approx(J^T J)^{-1},\qquad R_{ind}=A\Sigma_\eta A^T+R_{floor}.$$
++
++保留完整的 4×4 协方差。像素噪声与模型误差下限可配置，重投影残差较大时增大不确定性。
++相机标定的 0.1448 px 不直接当作每帧检测的角点噪声。
++同一帧的 IMU 姿态误差由所有板共享，因此联合更新的量测噪声块为
++
++$$R_{ab}=\delta_{ab}R_{ind,a}+G_aG_b^T.$$
++
++这些协方差仍是条件于给定先验的一阶近似，实拍没有角点真值，未宣称已经标定实际协方差。
++
++## 4. 运动与观测模型
++
++参考同济 SuperPower 的两组半径/高度建模，状态为
++
++$$x=[c_x,v_x,c_y,v_y,z_a,v_z,\theta,\omega,r,\Delta r,\Delta h]^T.$$
++
++短时模型为 $c_x^+=c_x+v_x\Delta t$、$c_y^+=c_y+v_y\Delta t$、$z_a^+=z_a+v_z\Delta t$、
++$\theta^+=\operatorname{wrap}(\theta+\omega\Delta t)$；速度、自转速度及机械几何延续上一时刻。
++过程噪声采用分段恒定随机加速度，位置/速度二元块为
++
++$$Q_a=\sigma_a^2\begin{bmatrix}\Delta t^4/4&\Delta t^3/2\\\Delta t^3/2&\Delta t^2\end{bmatrix}.$$
++
++平面、竖直和角加速度分别配置标准差；机械几何只留很小的随机游走。
++初始化使用 $c=p+r[\cos\theta,\sin\theta]$ 的完整 Jacobian 传播量测和半径先验，保留车心与角度/半径的相关性。
++
++对板槽 $j=0,1,2,3$，令 $b_j=j\bmod2$，$\alpha_j=\theta+j\pi/2$，
++$r_j=r+b_j\Delta r+\delta r_j$，则
++
++$$h_j(x)=\begin{bmatrix}c_x-r_j\cos\alpha_j\\c_y-r_j\sin\alpha_j\\z_a+b_j\Delta h+\delta h_j\\\operatorname{wrap}(\alpha_j)\end{bmatrix}.$$
++
++$\delta r_j,\delta h_j$ 为已知安装修正，当前为零。板槽固定在首次建立的参考上，重捕后板号不等同于真实物理编号。
++半径需处于配置机械范围；非物理更新直接拒绝，不单独截断均值而保持旧协方差。
++
++## 5. 匹配与跳变处理
++
++先预测至当前帧，再对每条量测和四个板槽计算位置/角度门限与马氏距离，按代价选取一对一匹配。
++同帧量测在同一个预测状态下联合更新，保留共享误差。联合门控失败时去掉最不一致的候选重试。
++门控使用相应自由度下 99.9% 卡方上分位数。NIS 在更新前计算；P 使用 Joseph 形式，并检查对称正定。
++
++普通切板只改变本次观测的槽号，保留车心、速度和角速度。
++无匹配时仅预测；连续 12 帧无融合则重捕；帧间隔超过 0.2 s 时重新建立轨迹。
++初始化和真正重捕分别记录，避免把首次初始化计作跟踪失败。
++
++## 6. 重投影与验证
++
++由整车状态计算四块板中心、朝向、两组半径和高度；板四角使用与安装 pitch 一致的基底，转换到拍摄时刻相机系后带畸变投影。
++背面预测板也绘制，用于显示四板整体几何；这些线框是模型推断，并非四块板都被检测到。
++
++在同一批原始角点、同样跳过前 30 帧的 501 帧上：
++
++| 指标 | 原 9 维版本 | 修改后 |
++| --- | ---: | ---: |
++| 匹配帧 | 463/501 | 463/501 |
++| 全部检测的重投影 RMS 中位数 | 29.88 px | 22.42 px |
++| 全部检测的重投影 RMS 90% 分位 | 65.73 px | 55.54 px |
++
++新版本完整处理 531 帧、794 次位姿量测，实际重捕 0 次，所有帧协方差检查通过。
++传统方案使用单独的噪声先验后，匹配帧由 322/501 提升为 382/501，实际重捕从 1 次降为 0 次；主交付采用 NN。
++40 次合成 Monte Carlo 的 NIS/自由度为 1.0031，11 维末帧平均 NEES 为 10.8871。
++100 次像素噪声试验的位置/yaw 四维平均 NEES 为 4.2301；完整构建与 4 项 CTest、时间/缓存集成检查均通过。
++完整数值和复跑命令见 [验证记录](results/revision/validation.md)。
++
++## 7. 项目结构与运行
++
++- `src/main_w3.cpp`：时间源、检测入口、量测生成、跟踪与输出。
++- `src/pose_estimator.cpp`、`pnp_solver.cpp`：平面候选、软安装先验与协方差。
++- `src/ekf9.cpp`、`tracker.cpp`：11 维滤波及四板匹配。
++- `imu_series.cpp`、`world_frame.cpp`、`frame_timeline.cpp`：姿态插值、变换与图像时间戳。
++- `state_visualizer.cpp`：从状态生成四板并重投影。
++- `tests/`：合成轨迹、动态 IMU、完整协方差、位姿和噪声传播测试。
++- `tools/`：曲线、统计、统一角点评价和集成检查。
++
++依赖及构建运行命令见 [README](README.md)。
++公开方案来源、版本和许可见 [参考说明](docs/OPEN_SOURCE_REFERENCES.md)。
++
++## 8. 思考与局限
++
++单板量测不能立即唯一确定车心与半径，需要随时间转动或多板观测提供信息。
++滤波半径趋稳不能证明机械尺寸正确；时间错位、外参误差和几何简化都可能被半径吸收。
++加入高度差减少了切板被误当作竖直运动的问题，但目标侧倾和未标定外参仍会产生残差。
++当前实拍评价证明模型一致性改善，不能证明场地位置精度或预测命中精度。
++后续首先应取得真实采集时间对应关系与相机/IMU 外参，再用独立数据检验噪声和机械参数。
++
++## 9. 提交信息（提交前填写）
++
++- 姓名：待填写。
++- 代码仓库链接：待填写真实地址。
++- PR 链接：待创建/填写。
++- 最终 commit hash：待实际提交后填写。

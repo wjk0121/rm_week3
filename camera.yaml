@@ -1,0 +1,107 @@
+%YAML:1.0
+---
+#  第三周(整车状态估计)配置: 内参/畸变/相机-IMU姿态映射/时间偏移/四板几何
+#  相机内参来自题目标定(重投影误差 0.1448 px),标定分辨率 1440x1080。
+
+camera_matrix: !!opencv-matrix
+   rows: 3
+   cols: 3
+   dt: d
+   data: [ 2362.2795952460974, 0., 679.17513921636282,
+           0., 2336.1916035376717, 529.06858905837635,
+           0., 0., 1. ]
+
+#  OpenCV 顺序 [k1, k2, p1, p2, k3]
+dist_coeffs: !!opencv-matrix
+   rows: 1
+   cols: 5
+   dt: d
+   data: [ -0.098561592108101559, 0.11173066531932681,
+           -0.0038352945867108721, -0.0020421443354436304, 0. ]
+
+image_width: 1440
+image_height: 1080
+
+#  第二周 PnP 点集(mm): 两灯条中心距 x 灯条长度
+#  注意: 55 是灯条长度,不是 125 的装甲板外框高度;改错会让 tz 按比例偏大。
+small_width: 135.0
+small_height: 55.0
+big_width: 225.0
+big_height: 55.0
+
+#  本周实拍视频为橙红色灯条
+enemy_color: "red"
+
+#  相机轴 -> IMU 轴的约定: 相机(x右,y下,z前) -> IMU(x前,y左,z上)
+#  这里表示轴向重排;题目未给相机-IMU 安装平移与精细外参,不能写成已标定外参。
+R_ci: !!opencv-matrix
+   rows: 3
+   cols: 3
+   dt: d
+   data: [ 0., 0., 1.,
+           -1., 0., 0.,
+           0., -1., 0. ]
+
+# 相机原点在 IMU 坐标系中的位置(m)，未提供实测外参时只能暂设零。
+t_ic: !!opencv-matrix
+   rows: 1
+   cols: 3
+   dt: d
+   data: [ 0., 0., 0. ]
+
+#  图像时间戳 + img_imu_offset = 查询 IMU 的时刻
+#  题目给定图像采集比收到时刻早 9 ms,所以这里是 -0.009 s。
+img_imu_offset: -0.009
+
+#  ---- 四板安装几何(m) ----
+#  r 是 0 号参考板半径;第 j 块实际半径 r_j = r + plate_radius_offset[j]
+#  高度 z_j = za + plate_dh[j]。相位按绕车一周 0/90/180/270 排布。
+#  半径初值取中性先验 0.20m,不是实测值:留出"由数据收敛到真值"的余地。
+#  半径稳定仅说明该模型下的估计趋稳，不能证明实际机械尺寸或可辨识性。
+#  高度差没有可靠真值，暂保持零。
+#  若确认目标车两组交替半径/两种安装高度,只改这两个数组,不改代码。
+plate_radius: 0.20
+plate_radius_offset: !!opencv-matrix
+   rows: 1
+   cols: 4
+   dt: d
+   data: [ 0., 0., 0., 0. ]
+plate_phase_deg: !!opencv-matrix
+   rows: 1
+   cols: 4
+   dt: d
+   data: [ 0., 90., 180., 270. ]
+plate_dh: !!opencv-matrix
+   rows: 1
+   cols: 4
+   dt: d
+   data: [ 0., 0., 0., 0. ]
+
+#  1 = 观测里加"板方位角"这一行(推荐);0 = 严格只用 3 维位置观测
+use_theta_obs: 1
+
+# 11-state model adds dr=r_odd-r_even and dh=z_odd-z_even as estimated states.
+estimate_pair_geometry: 1
+radius_min: 0.12
+radius_max: 0.40
+
+# Ordinary infantry plate installation prior (inward normal, world +z upwards).
+# Assumed mechanical pitch, NOT a calibration result for this particular robot.
+# Shared by constrained pose fitting and four-plate reprojection.
+plate_inward_pitch_deg: -15.0
+constrain_plate_pitch: 1
+plate_pitch_sigma_deg: 5.0
+plate_roll_sigma_deg: 5.0
+
+# Detector/model uncertainty priors; full covariance is propagated through the pixel Jacobian.
+# Floors represent unmodelled detector/calibration error. They are not ground-truth calibration.
+corner_sigma_px: 1.5
+position_noise_floor_m: 0.01
+yaw_noise_floor_deg: 3.0
+imu_attitude_sigma_deg: 0.3
+
+# Traditional threshold/dilation/rectangle endpoints are less precise than NN keypoints.
+# Separate priors; not calibrated ground-truth detector errors.
+traditional_corner_sigma_px: 3.0
+traditional_position_floor_m: 0.02
+traditional_yaw_floor_deg: 5.0

@@ -1,0 +1,50 @@
+{
+  "evaluated_frames": 501,
+  "common_matched_frames": 433,
+  "baseline": {
+    "matched_frames": 463,
+    "pre_reprojection_matched": {
+      "n": 463,
+      "median": 23.782789,
+      "p90": 78.613085
+    },
+    "pre_reprojection_common_frames": {
+      "n": 433,
+      "median": 22.419443,
+      "p90": 69.247509
+    },
+    "all_detection_reprojection": {
+      "n": 501,
+      "median": 29.8783,
+      "p90": 65.7333
+    }
+  },
+  "updated": {
+    "matched_frames": 463,
+    "pre_reprojection_matched": {
+      "n": 463,
+      "median": 20.07223453,
+      "p90": 60.6064107
+    },
+    "pre_reprojection_common_frames": {
+      "n": 433,
+      "median": 20.30021085,
+      "p90": 61.17860956
+    },
+    "all_detection_reprojection": {
+      "n": 501,
+      "median": 22.4224,
+      "p90": 55.5445
+    }
+  },
+  "median_reduction_percent": 24.954230997078145,
+  "checks": {
+    "all_frames_processed": true,
+    "no_pose_rejection": true,
+    "covariance_positive_definite": true,
+    "no_reinitialization": true,
+    "matched_coverage_not_lower": true,
+    "raw_reprojection_median_improved": true,
+    "raw_reprojection_p90_improved": true
+  }
+}

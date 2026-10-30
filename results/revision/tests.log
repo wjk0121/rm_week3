@@ -1,0 +1,93 @@
+Start testing: Oct 30 13:42 CST
+----------------------------------------------------------
+1/4 Testing: ekf_synth
+1/4 Test: ekf_synth
+Command: "/home/wang/rm_week3/build/test_ekf_synth"
+Directory: /home/wang/rm_week3/build
+"ekf_synth" start time: Oct 30 13:42 CST
+Output:
+----------------------------------------------------------
+---- A. 半径与配置一致 (0.200 m) ----
+评估帧数        : 434
+位置误差 中位数 : 0.0014 m
+位置误差 95%   : 0.0028 m
+自转角误差 中位 : 0.13 deg (对 90° 取模)
+最终 omega      : 1.604 rad/s (真值 1.600)
+最终 r          : 0.200 m   (真值 0.200, 配置初值 0.200)
+重新初始化次数  : 3
+[PASS]
+
+---- B. 半径与配置不符 (0.232 m) ----
+评估帧数        : 434
+位置误差 中位数 : 0.0015 m
+位置误差 95%   : 0.0039 m
+自转角误差 中位 : 0.14 deg (对 90° 取模)
+最终 omega      : 1.594 rad/s (真值 1.600)
+最终 r          : 0.232 m   (真值 0.232, 配置初值 0.200)
+重新初始化次数  : 3
+[PASS]
+
+目标类别门控: PASS; 量测协方差权重: PASS
+双板关联与大小传递: PASS
+EKF + 跟踪器自检通过
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"ekf_synth" end time: Oct 30 13:42 CST
+"ekf_synth" time elapsed: 00:00:00
+----------------------------------------------------------
+
+2/4 Testing: world_frame
+2/4 Test: world_frame
+Command: "/home/wang/rm_week3/build/test_world_frame"
+Directory: /home/wang/rm_week3/build
+"world_frame" start time: Oct 30 13:42 CST
+Output:
+----------------------------------------------------------
+Invalid/nonmonotonic IMU row 2
+Invalid/nonmonotonic IMU row 2
+Invalid/nonmonotonic IMU row 2
+Dynamic rotation, interpolation, time-offset and timestamp validation: PASS
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"world_frame" end time: Oct 30 13:42 CST
+"world_frame" time elapsed: 00:00:00
+----------------------------------------------------------
+
+3/4 Testing: covariance
+3/4 Test: covariance
+Command: "/home/wang/rm_week3/build/test_covariance"
+Directory: /home/wang/rm_week3/build
+"covariance" start time: Oct 30 13:42 CST
+Output:
+----------------------------------------------------------
+Monte Carlo: NIS/dof=1.00306 final mean NEES=10.8871 (11 states), accepted=5998
+<end of output>
+Test time =   0.22 sec
+----------------------------------------------------------
+Test Passed.
+"covariance" end time: Oct 30 13:43 CST
+"covariance" time elapsed: 00:00:00
+----------------------------------------------------------
+
+4/4 Testing: pose
+4/4 Test: pose
+Command: "/home/wang/rm_week3/build/test_pose"
+Directory: /home/wang/rm_week3/build
+"pose" start time: Oct 30 13:43 CST
+Output:
+----------------------------------------------------------
+Pixel-noise Monte Carlo: valid=100 mean pose NEES=4.23011 (4 DoF)
+Invalid week3 configuration: Invalid shape: camera_matrix
+<end of output>
+Test time =   0.12 sec
+----------------------------------------------------------
+Test Passed.
+"pose" end time: Oct 30 13:43 CST
+"pose" time elapsed: 00:00:00
+----------------------------------------------------------
+
+End testing: Oct 30 13:43 CST
