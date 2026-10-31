@@ -23,7 +23,7 @@ ctest --test-dir build --output-on-failure
 
 已验证环境：GCC 15.2.0、OpenCV 4.10.0、ONNX Runtime 1.20.1、Python 3.14.4。
 需要以下输入文件：`data/test.avi`、`data/imu.txt`、`models/Infantry-v8n.onnx`，传统方案还需 `models/mlp.onnx`。
-模型与原第二周作业一致。大文件未纳入源码提交；重新 clone 后需按此目录结构放入题目提供的文件。
+模型与原第二周作业一致，随仓库提交；只有 `data/` 下的课程素材不入库，重新 clone 后按上表放入即可。
 本数据视频 SHA-256：`864f7d83000885beee606c2dec2025da5bfe6cf6b91350b77d34d33b04716c3f`；
 IMU SHA-256：`950b2695188565207fc606c201ca013125f9e632623fb6a6f10a26a49b6c9c00`。
 
@@ -125,5 +125,5 @@ python3 tools/check_cli.py
 四项 CTest 验证可见板跟踪、动态 IMU/SLERP、两组几何、相关量测联合更新、合成 NIS/NEES、位姿双解及像素协方差传播。
 
 修改前后对比及限制见 [results/revision/validation.md](results/revision/validation.md)。
-报告草稿见 [视觉第三周作业_姓名.md](视觉第三周作业_姓名.md)，提交前填写姓名与真实仓库/PR/commit 信息。
+报告见 [视觉第三周作业_王进康.md](视觉第三周作业_王进康.md)。
 公开方案来源及许可见 [docs/OPEN_SOURCE_REFERENCES.md](docs/OPEN_SOURCE_REFERENCES.md)。
